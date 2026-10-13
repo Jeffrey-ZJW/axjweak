@@ -28,19 +28,25 @@ jobs:
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           SDK_NAME=$(basename $SDK_PATH)
+          echo "SDK_PATH=$SDK_PATH"
+          echo "SDK_NAME=$SDK_NAME"
+          REAL_PATH=$(readlink -f "$SDK_PATH" || realpath "$SDK_PATH")
+          echo "REAL_PATH=$REAL_PATH"
           mkdir -p $THEOS/sdks
-          cp -R $SDK_PATH $THEOS/sdks/$SDK_NAME
+          cp -RL "$REAL_PATH" "$THEOS/sdks/$SDK_NAME"
+          echo "--- SDK 目录内容 ---"
           ls -la $THEOS/sdks/
+          ls -la $THEOS/sdks/$SDK_NAME/ | head -20
+      
+      - name: Verify
+        run: |
+          echo "THEOS=$THEOS"
+          ls -la $THEOS/makefiles/common.mk
+          ls -la $THEOS/sdks/
+          ls -la $THEOS/sdks/*/ | head -20
       
       - name: Build
         run: |
-          echo "当前目录: $(pwd)"
-          echo "THEOS=$THEOS"
-          ls -la $THEOS/makefiles/common.mk || echo "common.mk 不存在!"
-          ls -la $THEOS/sdks/ || echo "sdks 目录不存在!"
-          echo "--- Makefile 内容 ---"
-          cat Makefile
-          echo "--- 开始编译 ---"
           export PATH=$THEOS/bin:$PATH
           make THEOS=$THEOS package FINALPACKAGE=1
       
