@@ -28,22 +28,15 @@ jobs:
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           SDK_NAME=$(basename $SDK_PATH)
-          echo "SDK_PATH=$SDK_PATH"
-          echo "SDK_NAME=$SDK_NAME"
           REAL_PATH=$(readlink -f "$SDK_PATH" || realpath "$SDK_PATH")
-          echo "REAL_PATH=$REAL_PATH"
           mkdir -p $THEOS/sdks
           cp -RL "$REAL_PATH" "$THEOS/sdks/$SDK_NAME"
-          echo "--- SDK 目录内容 ---"
-          ls -la $THEOS/sdks/
-          ls -la $THEOS/sdks/$SDK_NAME/ | head -20
-      
-      - name: Verify
-        run: |
-          echo "THEOS=$THEOS"
-          ls -la $THEOS/makefiles/common.mk
-          ls -la $THEOS/sdks/
-          ls -la $THEOS/sdks/*/ | head -20
+          
+          # 关键：删掉冲突的 libxml 目录
+          rm -rf $THEOS/sdks/$SDK_NAME/usr/include/libxml
+          
+          echo "--- SDK 内容检查 ---"
+          ls -la $THEOS/sdks/$SDK_NAME/usr/include/ | grep -i xml
       
       - name: Build
         run: |
