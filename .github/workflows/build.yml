@@ -24,19 +24,17 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $THEOS
           ls -la $THEOS/makefiles/common.mk
       
-      - name: Setup iOS SDK from Xcode
+      - name: Download iOS SDK from theos/sdks
         run: |
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          SDK_NAME=$(basename $SDK_PATH)
-          REAL_PATH=$(readlink -f "$SDK_PATH" || realpath "$SDK_PATH")
           mkdir -p $THEOS/sdks
-          cp -RL "$REAL_PATH" "$THEOS/sdks/$SDK_NAME"
-          
-          # 关键：删掉冲突的 libxml 目录
-          rm -rf $THEOS/sdks/$SDK_NAME/usr/include/libxml
-          
-          echo "--- SDK 内容检查 ---"
-          ls -la $THEOS/sdks/$SDK_NAME/usr/include/ | grep -i xml
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+          echo "--- 可用 SDK 列表 ---"
+          ls /tmp/theos-sdks/
+          LATEST_SDK=$(ls -d /tmp/theos-sdks/iPhoneOS*.sdk | sort -V | tail -1)
+          echo "--- 选择 SDK: $LATEST_SDK ---"
+          cp -R "$LATEST_SDK" $THEOS/sdks/
+          echo "--- 最终 SDK 目录 ---"
+          ls -la $THEOS/sdks/
       
       - name: Build
         run: |
