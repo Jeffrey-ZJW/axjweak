@@ -1,0 +1,36 @@
+name: Build Tweak
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      
+      - name: Install Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+      
+      - name: Install Dependencies
+        run: |
+          brew install ldid dpkg
+      
+      - name: Build
+        run: |
+          make clean
+          make package FINALPACKAGE=1
+      
+      - name: Upload .deb
+        uses: actions/upload-artifact@v3
+        with:
+          name: fishtweak-deb
+          path: packages/*.deb
