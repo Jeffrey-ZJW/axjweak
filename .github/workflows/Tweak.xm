@@ -83,24 +83,9 @@ static NSString *getOrDeriveUUID(void) {
 
 %end
 
-%hook NSUUID
-
-- (NSString *)UUIDString {
-    NSString *orig = %orig;
-    if (orig && orig.length == 36 && [orig containsString:@"-"]) {
-        NSString *newUUIDStr = getOrDeriveUUID();
-        if (newUUIDStr) {
-            return newUUIDStr;
-        }
-    }
-    return orig;
-}
-
-%end
-
 %ctor {
     NSLog(@"[FishTweak] 插件已加载 v1.0.0");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *uuid = getOrDeriveUUID();
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
     });
