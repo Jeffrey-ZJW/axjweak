@@ -11,7 +11,7 @@ jobs:
     
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       
       - name: Install Theos
         run: |
@@ -24,10 +24,21 @@ jobs:
         run: |
           brew install ldid dpkg
       
+      - name: Install SDKs
+        run: |
+          $THEOS/bin/install-theos-sdks || true
+      
+      - name: Verify Theos
+        run: |
+          echo "THEOS=$THEOS"
+          ls -la $THEOS/makefiles/ || echo "makefiles not found"
+          ls -la $THEOS/sdks/ || echo "sdks not found"
+      
       - name: Build
         run: |
-          make clean
           make package FINALPACKAGE=1
+        env:
+          THEOS: ${{ env.THEOS }}
       
       - name: Upload .deb
         uses: actions/upload-artifact@v4
