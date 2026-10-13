@@ -11,7 +11,7 @@ jobs:
     
     steps:
       - name: Checkout
-        uses: actions/upload-artifact@v4
+        uses: actions/checkout@v3
       
       - name: Install Theos
         run: |
@@ -30,7 +30,7 @@ jobs:
           make package FINALPACKAGE=1
       
       - name: Upload .deb
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: fishtweak-deb
           path: packages/*.deb
