@@ -7,38 +7,44 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-13
+    env:
+      THEOS: /Users/runner/theos
     
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       
-      - name: Install Theos
-        run: |
-          export THEOS=$HOME/theos
-          git clone --recursive https://github.com/theos/theos.git $THEOS
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          echo "$THEOS/bin" >> $GITHUB_PATH
-      
       - name: Install Dependencies
         run: |
           brew install ldid dpkg
       
-      - name: Install SDKs
+      - name: Setup Theos
         run: |
-          $THEOS/bin/install-theos-sdks || true
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          echo "--- 验证 Theos ---"
+          ls -la $THEOS/makefiles/common.mk
       
-      - name: Verify Theos
+      - name: Setup iOS SDK from Xcode
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_NAME=$(basename $SDK_PATH)
+          echo "找到 SDK: $SDK_PATH"
+          mkdir -p $THEOS/sdks
+          cp -R $SDK_PATH $THEOS/sdks/$SDK_NAME
+          echo "--- SDK 目录内容 ---"
+          ls -la $THEOS/sdks/
+      
+      - name: Verify
         run: |
           echo "THEOS=$THEOS"
-          ls -la $THEOS/makefiles/ || echo "makefiles not found"
-          ls -la $THEOS/sdks/ || echo "sdks not found"
+          ls -la $THEOS/makefiles/common.mk || echo "MISSING common.mk"
+          ls -la $THEOS/sdks/ || echo "MISSING sdks"
       
       - name: Build
         run: |
+          export PATH=$THEOS/bin:$PATH
           make package FINALPACKAGE=1
-        env:
-          THEOS: ${{ env.THEOS }}
       
       - name: Upload .deb
         uses: actions/upload-artifact@v4
