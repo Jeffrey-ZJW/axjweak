@@ -1,0 +1,16 @@
+﻿FishTweak v2.0.0
+================
+新增功能：本地HTTP服务 127.0.0.1:8888
+
+接口：
+1. 发送改密码短信:
+   http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
+
+2. 重置密码:
+   http://127.0.0.1:8888/reset_password?mobile=手机号&code=验证码&password=明文密码&uuid=设备UUID
+
+按键精灵里这样调用：
+  Url.Get("http://127.0.0.1:8888/send_sms?mobile=" & 手机号 & "&uuid=" & 获取UUID())
+  Url.Get("http://127.0.0.1:8888/reset_password?mobile=" & 手机号 & "&code=" & 验证码 & "&password=" & 密码 & "&uuid=" & 获取UUID())
+
+注意：密码参数是明文密码（如999999），插件内部自动做MD5处理

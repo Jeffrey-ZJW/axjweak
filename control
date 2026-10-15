@@ -1,8 +1,8 @@
 Package: com.jeffrey.fishtweak
 Name: FishTweak
-Version: 1.0.0
+Version: 2.0.0
 Architecture: iphoneos-arm
-Description: 为捕鱼大决战生成环境专属IDFA
+Description: 为捕鱼大决战生成环境专属IDFA + 本地HTTP发请求
 Maintainer: Jeffrey
 Author: Jeffrey
 Section: Tweaks
