@@ -2,6 +2,11 @@
 #import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <objc/runtime.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <string.h>
 
 // ========================================
 //  IDFA 伪造（原有功能）
@@ -181,7 +186,7 @@ static void handleLocalRequest(int clientSocket, NSString *path) {
         NSString *uuid = params[@"uuid"];
         if (!mobile || !uuid) { sendLocalHttpResponse(clientSocket, @{@"error": @"missing mobile/uuid"}); return; }
 
-        NSString *ts = [NSString stringWithFormat:@"%ld", (long long)[[NSDate date] timeIntervalSince1970]];
+        NSString *ts = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
         NSString *sesskey = generateSesskey();
         NSString *did = generateDid(uuid, ts);
         NSString *sign = calculateSign(did, mobile, sesskey, @"2");
