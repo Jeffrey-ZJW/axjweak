@@ -77,7 +77,7 @@ static NSString *getOrDeriveUUID(void) {
 %end
 
 // ========================================
-//  本地 HTTP 服务 + 游戏API请求（新增 v2.0）
+//  本地 HTTP 服务 + 游戏API请求（v2.1）
 // ========================================
 static NSString *const kAPIHost = @"https://openapi.buyuios.com";
 static NSString *const kPackageNo = @"10011001001";
@@ -131,8 +131,10 @@ static NSString *calculateSign(NSString *did, NSString *mobile, NSString *sesske
     return hex;
 }
 
-static NSString *generateSesskey() {
-    return [NSString stringWithFormat:@"%d", arc4random_uniform(90000) + 10000];
+static NSString *sesskeyForMobile(NSString *mobile) {
+    long long num = mobile.longLongValue;
+    long long result = ((num * 137) % 90000) + 10000;
+    return [NSString stringWithFormat:@"%lld", result];
 }
 
 static NSString *md5Password(NSString *plainPwd) {
@@ -187,7 +189,7 @@ static void handleLocalRequest(int clientSocket, NSString *path) {
         if (!mobile || !uuid) { sendLocalHttpResponse(clientSocket, @{@"error": @"missing mobile/uuid"}); return; }
 
         NSString *ts = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
-        NSString *sesskey = generateSesskey();
+        NSString *sesskey = sesskeyForMobile(mobile);
         NSString *did = generateDid(uuid, ts);
         NSString *sign = calculateSign(did, mobile, sesskey, @"2");
 
@@ -216,7 +218,7 @@ static void handleLocalRequest(int clientSocket, NSString *path) {
             return;
         }
         NSString *pwd16 = md5Password(password);
-        NSString *sesskey = generateSesskey();
+        NSString *sesskey = sesskeyForMobile(mobile);
         NSDictionary *body = @{
             @"code": code,
             @"deviceNumber": uuid,
@@ -272,7 +274,7 @@ static void *httpAcceptThread(void *arg) {
 }
 
 %ctor {
-    NSLog(@"[FishTweak] 插件已加载 v2.0.0");
+    NSLog(@"[FishTweak] 插件已加载 v2.1.0");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *uuid = getOrDeriveUUID();
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
