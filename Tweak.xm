@@ -77,8 +77,16 @@ static NSString *getOrDeriveUUID(void) {
 %end
 
 // ========================================
-//  本地 HTTP 服务 + 游戏API请求（v2.1）
+//  本地 HTTP 服务 + 游戏API请求（v2.2）
 // ========================================
+
+static NSString *buildUserAgent(void) {
+    NSString *iosVer = [[UIDevice currentDevice] systemVersion];
+    CGFloat screenScale = [[UIScreen mainScreen] scale];
+    NSString *scaleStr = (screenScale > 2.5) ? @"3.00" : @"2.00";
+    return [NSString stringWithFormat:@"Fuel5/2.13.1 (iPhone; iOS %@; Scale/%@)", iosVer, scaleStr];
+}
+
 static NSString *const kAPIHost = @"https://openapi.buyuios.com";
 static NSString *const kPackageNo = @"10011001001";
 static const int kLocalPort = 8888;
@@ -146,13 +154,20 @@ static NSString *md5Password(NSString *plainPwd) {
     return [hex substringWithRange:NSMakeRange(8, 16)];
 }
 
+static NSString *buildUserAgent(void) {
+    NSString *iosVer = [[UIDevice currentDevice] systemVersion];
+    CGFloat screenScale = [[UIScreen mainScreen] scale];
+    NSString *scaleStr = (screenScale > 2.5) ? @"3.00" : @"2.00";
+    return [NSString stringWithFormat:@"Fuel5/2.13.1 (iPhone; iOS %@; Scale/%@)", iosVer, scaleStr];
+}
+
 static void sendGameRequest(NSString *path, NSDictionary *bodyDict, void (^callback)(NSDictionary *response)) {
     NSString *url = [NSString stringWithFormat:@"%@%@?api-version=1", kAPIHost, path];
     NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     [req setHTTPMethod:@"POST"];
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [req setValue:@"Fuel5/2.13.1 (iPhone; iOS 12.0; Scale/2.00)" forHTTPHeaderField:@"User-Agent"];
+    [req setValue:buildUserAgent() forHTTPHeaderField:@"User-Agent"];
     [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
     [req setValue:@"br, gzip, deflate" forHTTPHeaderField:@"Accept-Encoding"];
     [req setValue:@"zh-Hans;q=1, en;q=0.9" forHTTPHeaderField:@"Accept-Language"];
@@ -274,7 +289,7 @@ static void *httpAcceptThread(void *arg) {
 }
 
 %ctor {
-    NSLog(@"[FishTweak] 插件已加载 v2.1.0");
+    NSLog(@"[FishTweak] 插件已加载 v2.2.0");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *uuid = getOrDeriveUUID();
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
