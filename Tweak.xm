@@ -107,7 +107,7 @@ static NSString *generateDid(NSString *uuid, NSString *timestamp) {
     for (int i = 0; i < padLen; i++) [padded appendBytes:&padByte length:1];
     NSMutableData *result = [NSMutableData dataWithLength:padded.length];
     size_t outLen = 0;
-    CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+    CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0,
             key.bytes, key.length, iv.bytes,
             padded.bytes, padded.length,
             result.mutableBytes, result.length, &outLen);
