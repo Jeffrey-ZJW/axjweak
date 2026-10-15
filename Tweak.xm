@@ -154,13 +154,6 @@ static NSString *md5Password(NSString *plainPwd) {
     return [hex substringWithRange:NSMakeRange(8, 16)];
 }
 
-static NSString *buildUserAgent(void) {
-    NSString *iosVer = [[UIDevice currentDevice] systemVersion];
-    CGFloat screenScale = [[UIScreen mainScreen] scale];
-    NSString *scaleStr = (screenScale > 2.5) ? @"3.00" : @"2.00";
-    return [NSString stringWithFormat:@"Fuel5/2.13.1 (iPhone; iOS %@; Scale/%@)", iosVer, scaleStr];
-}
-
 static void sendGameRequest(NSString *path, NSDictionary *bodyDict, void (^callback)(NSDictionary *response)) {
     NSString *url = [NSString stringWithFormat:@"%@%@?api-version=1", kAPIHost, path];
     NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
