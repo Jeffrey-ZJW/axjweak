@@ -2,11 +2,18 @@
 #import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <objc/runtime.h>
+#include <substrate.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <time.h>
+#include <stdlib.h>
 
 // ========================================
 //  IDFA 伪造（原有功能）
@@ -281,8 +288,165 @@ static void *httpAcceptThread(void *arg) {
     return NULL;
 }
 
+// ========================================
+//  SysFileTime + bootTimeInSec 伪造 + VPN 隐藏（v2.3 新增）
+// ========================================
+static struct timeval gFakeBootTime = {0, 0};     // boot 伪值（sysctl kern.boottime）
+static struct timespec gFakeSysTime = {0, 0};     // sys 伪值（MCMeta.plist 的 st_mtime）
+static int gTweakEnabled = 1;                     // 总开关
+
+// 生成成对伪值: boot 必须在 sys 之后（避免"文件创建晚于开机"破绽）
+static void initFakeTimes(void) {
+    time_t now = time(NULL);
+    time_t sysOffset = 3600 + (arc4random_uniform(172800));      // sys = 当前时间往前 1~48h
+    time_t bootGap    = 600 + (arc4random_uniform(21600));       // boot 在 sys 之后 10min~6h
+    gFakeSysTime.tv_sec  = now - sysOffset;
+    gFakeSysTime.tv_nsec = arc4random_uniform(1000000000);
+    gFakeBootTime.tv_sec  = gFakeSysTime.tv_sec + bootGap;
+    gFakeBootTime.tv_usec = arc4random_uniform(1000000);
+    NSLog(@"[FishTweak] 伪造 sys=%lld.%09ld boot=%lld.%06ld (boot>sys ✓)",
+          (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec,
+          (long long)gFakeBootTime.tv_sec, gFakeBootTime.tv_usec);
+}
+
+// ---- sysctl: 拦截 kern.boottime 返回伪 boot ----
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
+static int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    if (!gTweakEnabled) return ret;
+    if (ret == 0 && oldp && namelen == 2 && name[0] == CTL_KERN && name[1] == KERN_BOOTTIME) {
+        struct timeval *tv = (struct timeval *)oldp;
+        tv->tv_sec = gFakeBootTime.tv_sec;
+        tv->tv_usec = gFakeBootTime.tv_usec;
+    }
+    return ret;
+}
+
+// ---- stat 系列: 命中 MCMeta.plist 改写 st_mtime 为伪 sys ----
+static int (*orig_stat64_fn)(const char *, struct stat64 *);
+static int my_stat64(const char *path, struct stat64 *st) {
+    int ret = orig_stat64_fn(path, st);
+    if (!gTweakEnabled || ret != 0 || !path || !st) return ret;
+    if (strstr(path, "MCMeta.plist") != NULL) {
+        st->st_mtimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_mtimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_atimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_atimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        NSLog(@"[FishTweak] stat64 命中 %s -> sys=%lld.%09ld", path,
+              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
+    }
+    return ret;
+}
+
+static int (*orig_stat_fn)(const char *, struct stat *);
+static int my_stat(const char *path, struct stat *st) {
+    int ret = orig_stat_fn(path, st);
+    if (!gTweakEnabled || ret != 0 || !path || !st) return ret;
+    if (strstr(path, "MCMeta.plist") != NULL) {
+        st->st_mtimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_mtimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_atimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_atimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        NSLog(@"[FishTweak] stat 命中 %s -> sys=%lld.%09ld", path,
+              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
+    }
+    return ret;
+}
+
+static int (*orig_lstat_fn)(const char *, struct stat *);
+static int my_lstat(const char *path, struct stat *st) {
+    int ret = orig_lstat_fn(path, st);
+    if (!gTweakEnabled || ret != 0 || !path || !st) return ret;
+    if (strstr(path, "MCMeta.plist") != NULL) {
+        st->st_mtimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_mtimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_atimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_atimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        NSLog(@"[FishTweak] lstat 命中 %s -> sys=%lld.%09ld", path,
+              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
+    }
+    return ret;
+}
+
+static int (*orig_lstat64_fn)(const char *, struct stat64 *);
+static int my_lstat64(const char *path, struct stat64 *st) {
+    int ret = orig_lstat64_fn(path, st);
+    if (!gTweakEnabled || ret != 0 || !path || !st) return ret;
+    if (strstr(path, "MCMeta.plist") != NULL) {
+        st->st_mtimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_mtimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_atimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_atimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        NSLog(@"[FishTweak] lstat64 命中 %s -> sys=%lld.%09ld", path,
+              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
+    }
+    return ret;
+}
+
+// ---- getifaddrs: 摘除 VPN 隧道接口（utun/ipsec/ppp/tun/tap）----
+static int (*orig_getifaddrs)(struct ifaddrs **);
+static int my_getifaddrs(struct ifaddrs **ifap) {
+    int ret = orig_getifaddrs(ifap);
+    if (!gTweakEnabled || ret != 0 || !ifap || !*ifap) return ret;
+    struct ifaddrs *cur = *ifap;
+    struct ifaddrs *prev = NULL;
+    int removedCount = 0;
+    while (cur != NULL) {
+        struct ifaddrs *next = cur->ifa_next;
+        const char *nm = cur->ifa_name ? cur->ifa_name : "";
+        int isVpn = (strncmp(nm, "utun", 4) == 0 || strncmp(nm, "ipsec", 5) == 0 ||
+                     strncmp(nm, "ppp", 3) == 0  || strncmp(nm, "tun", 3) == 0 ||
+                     strncmp(nm, "tap", 3) == 0);
+        if (isVpn) {
+            if (prev) prev->ifa_next = next;
+            else *ifap = next;
+            removedCount++;
+        } else {
+            prev = cur;
+        }
+        cur = next;
+    }
+    if (removedCount > 0) {
+        NSLog(@"[FishTweak] VPN隐身: 摘除 %d 个隧道接口 (utun/ipsec/ppp)", removedCount);
+    }
+    return ret;
+}
+
+// ---- if_nametoindex: 隧道名查询返回 0 ----
+static unsigned int (*orig_if_nametoindex)(const char *);
+static unsigned int my_if_nametoindex(const char *ifname) {
+    if (gTweakEnabled && ifname) {
+        if (strncmp(ifname, "utun", 4) == 0 || strncmp(ifname, "ipsec", 5) == 0 ||
+            strncmp(ifname, "ppp", 3) == 0  || strncmp(ifname, "tun", 3) == 0 ||
+            strncmp(ifname, "tap", 3) == 0) {
+            return 0;
+        }
+    }
+    return orig_if_nametoindex(ifname);
+}
+
 %ctor {
-    NSLog(@"[FishTweak] 插件已加载 v2.2.0");
+    NSLog(@"[FishTweak] 插件已加载 v2.3.0");
+    initFakeTimes();
+
+    // ---- v2.3: sys/boot 伪造 + VPN 隐藏 ----
+    MSHookFunction(&sysctl, (void *)&my_sysctl, (void **)&orig_sysctl);
+    MSHookFunction(&stat64, (void *)&my_stat64, (void **)&orig_stat64_fn);
+    MSHookFunction(&stat, (void *)&my_stat, (void **)&orig_stat_fn);
+    MSHookFunction(&lstat, (void *)&my_lstat, (void **)&orig_lstat_fn);
+    MSHookFunction(&lstat64, (void *)&my_lstat64, (void **)&orig_lstat64_fn);
+    MSHookFunction(&getifaddrs, (void *)&my_getifaddrs, (void **)&orig_getifaddrs);
+    MSHookFunction(&if_nametoindex, (void *)&my_if_nametoindex, (void **)&orig_if_nametoindex);
+    NSLog(@"[FishTweak] v2.3 hook 就绪: sysctl/stat*/getifaddrs/if_nametoindex");
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *uuid = getOrDeriveUUID();
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
