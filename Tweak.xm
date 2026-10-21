@@ -14,6 +14,7 @@
 #include <net/if.h>
 #include <time.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 
 // ========================================
 //  IDFA 伪造（原有功能）
@@ -303,10 +304,10 @@ static void initFakeTimes(void) {
     gFakeSysTime.tv_sec  = now - sysOffset;
     gFakeSysTime.tv_nsec = arc4random_uniform(1000000000);
     gFakeBootTime.tv_sec  = gFakeSysTime.tv_sec + bootGap;
-    gFakeBootTime.tv_usec = arc4random_uniform(1000000);
-    NSLog(@"[FishTweak] 伪造 sys=%lld.%09ld boot=%lld.%06ld (boot>sys ✓)",
-          (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec,
-          (long long)gFakeBootTime.tv_sec, gFakeBootTime.tv_usec);
+    gFakeBootTime.tv_usec = (__darwin_suseconds_t)arc4random_uniform(1000000);
+    NSLog(@"[FishTweak] 伪造 sys=%lld.%09ld boot=%lld.%06d (boot>sys ✓)",
+          (long long)gFakeSysTime.tv_sec, (long)gFakeSysTime.tv_nsec,
+          (long long)gFakeBootTime.tv_sec, (int)gFakeBootTime.tv_usec);
 }
 
 // ---- sysctl: 拦截 kern.boottime 返回伪 boot ----
@@ -323,23 +324,8 @@ static int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void
 }
 
 // ---- stat 系列: 命中 MCMeta.plist 改写 st_mtime 为伪 sys ----
-static int (*orig_stat64_fn)(const char *, struct stat64 *);
-static int my_stat64(const char *path, struct stat64 *st) {
-    int ret = orig_stat64_fn(path, st);
-    if (!gTweakEnabled || ret != 0 || !path || !st) return ret;
-    if (strstr(path, "MCMeta.plist") != NULL) {
-        st->st_mtimespec.tv_sec  = gFakeSysTime.tv_sec;
-        st->st_mtimespec.tv_nsec = gFakeSysTime.tv_nsec;
-        st->st_atimespec.tv_sec  = gFakeSysTime.tv_sec;
-        st->st_atimespec.tv_nsec = gFakeSysTime.tv_nsec;
-        st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
-        st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
-        NSLog(@"[FishTweak] stat64 命中 %s -> sys=%lld.%09ld", path,
-              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
-    }
-    return ret;
-}
-
+// arm64 上 stat 本身就是 64 位宽（无独立 struct stat64），
+// stat64/lstat64 符号存在时用 dlsym 动态 hook 到同一实现。
 static int (*orig_stat_fn)(const char *, struct stat *);
 static int my_stat(const char *path, struct stat *st) {
     int ret = orig_stat_fn(path, st);
@@ -352,7 +338,7 @@ static int my_stat(const char *path, struct stat *st) {
         st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
         st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
         NSLog(@"[FishTweak] stat 命中 %s -> sys=%lld.%09ld", path,
-              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
+              (long long)gFakeSysTime.tv_sec, (long)gFakeSysTime.tv_nsec);
     }
     return ret;
 }
@@ -369,13 +355,31 @@ static int my_lstat(const char *path, struct stat *st) {
         st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
         st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
         NSLog(@"[FishTweak] lstat 命中 %s -> sys=%lld.%09ld", path,
-              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
+              (long long)gFakeSysTime.tv_sec, (long)gFakeSysTime.tv_nsec);
     }
     return ret;
 }
 
-static int (*orig_lstat64_fn)(const char *, struct stat64 *);
-static int my_lstat64(const char *path, struct stat64 *st) {
+// stat64/lstat64 独立 orig 指针（arm64 布局与 stat 一致，类型复用 struct stat*）
+static int (*orig_stat64_fn)(const char *, struct stat *);
+static int my_stat64(const char *path, struct stat *st) {
+    int ret = orig_stat64_fn(path, st);
+    if (!gTweakEnabled || ret != 0 || !path || !st) return ret;
+    if (strstr(path, "MCMeta.plist") != NULL) {
+        st->st_mtimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_mtimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_atimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_atimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
+        st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
+        NSLog(@"[FishTweak] stat64 命中 %s -> sys=%lld.%09ld", path,
+              (long long)gFakeSysTime.tv_sec, (long)gFakeSysTime.tv_nsec);
+    }
+    return ret;
+}
+
+static int (*orig_lstat64_fn)(const char *, struct stat *);
+static int my_lstat64(const char *path, struct stat *st) {
     int ret = orig_lstat64_fn(path, st);
     if (!gTweakEnabled || ret != 0 || !path || !st) return ret;
     if (strstr(path, "MCMeta.plist") != NULL) {
@@ -386,7 +390,7 @@ static int my_lstat64(const char *path, struct stat64 *st) {
         st->st_ctimespec.tv_sec  = gFakeSysTime.tv_sec;
         st->st_ctimespec.tv_nsec = gFakeSysTime.tv_nsec;
         NSLog(@"[FishTweak] lstat64 命中 %s -> sys=%lld.%09ld", path,
-              (long long)gFakeSysTime.tv_sec, gFakeSysTime.tv_nsec);
+              (long long)gFakeSysTime.tv_sec, (long)gFakeSysTime.tv_nsec);
     }
     return ret;
 }
@@ -438,13 +442,21 @@ static unsigned int my_if_nametoindex(const char *ifname) {
     initFakeTimes();
 
     // ---- v2.3: sys/boot 伪造 + VPN 隐藏 ----
-    MSHookFunction(&sysctl, (void *)&my_sysctl, (void **)&orig_sysctl);
-    MSHookFunction(&stat64, (void *)&my_stat64, (void **)&orig_stat64_fn);
-    MSHookFunction(&stat, (void *)&my_stat, (void **)&orig_stat_fn);
-    MSHookFunction(&lstat, (void *)&my_lstat, (void **)&orig_lstat_fn);
-    MSHookFunction(&lstat64, (void *)&my_lstat64, (void **)&orig_lstat64_fn);
-    MSHookFunction(&getifaddrs, (void *)&my_getifaddrs, (void **)&orig_getifaddrs);
-    MSHookFunction(&if_nametoindex, (void *)&my_if_nametoindex, (void **)&orig_if_nametoindex);
+    // MSHookFunction 需要显式 void* cast（C++ 不允许函数指针隐式转 void*）
+    MSHookFunction((void *)&sysctl, (void *)&my_sysctl, (void **)&orig_sysctl);
+    MSHookFunction((void *)&stat, (void *)&my_stat, (void **)&orig_stat_fn);
+    MSHookFunction((void *)&lstat, (void *)&my_lstat, (void **)&orig_lstat_fn);
+    // arm64 下 stat64/lstat64 符号存在则动态 hook（布局与 stat 一致）
+    void *symStat64 = dlsym(RTLD_DEFAULT, "stat64");
+    if (symStat64) {
+        MSHookFunction(symStat64, (void *)&my_stat64, (void **)&orig_stat64_fn);
+    }
+    void *symLstat64 = dlsym(RTLD_DEFAULT, "lstat64");
+    if (symLstat64) {
+        MSHookFunction(symLstat64, (void *)&my_lstat64, (void **)&orig_lstat64_fn);
+    }
+    MSHookFunction((void *)&getifaddrs, (void *)&my_getifaddrs, (void **)&orig_getifaddrs);
+    MSHookFunction((void *)&if_nametoindex, (void *)&my_if_nametoindex, (void **)&orig_if_nametoindex);
     NSLog(@"[FishTweak] v2.3 hook 就绪: sysctl/stat*/getifaddrs/if_nametoindex");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
