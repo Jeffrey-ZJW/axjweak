@@ -249,9 +249,65 @@ static void handleLocalRequest(int clientSocket, NSString *path) {
             sendLocalHttpResponse(clientSocket, resp);
         });
 
+    } else if ([reqPath isEqualToString:@"/status"]) {
+        // ============ 自检接口: 验证插件生效 + VPN 隐藏 + sys/boot 伪造 ============
+        // 真实隧道数: 走 orig_getifaddrs（绕过 hook），看系统实际有没有隧道
+        int realCount = 0;
+        struct ifaddrs *realIfs = NULL;
+        if (orig_getifaddrs && orig_getifaddrs(&realIfs) == 0) {
+            struct ifaddrs *cur = realIfs;
+            while (cur) {
+                const char *nm = cur->ifa_name ? cur->ifa_name : "";
+                if (strncmp(nm, "utun", 4) == 0 || strncmp(nm, "ipsec", 5) == 0 ||
+                    strncmp(nm, "ppp", 3) == 0 || strncmp(nm, "tun", 3) == 0 ||
+                    strncmp(nm, "tap", 3) == 0) realCount++;
+                cur = cur->ifa_next;
+            }
+            freeifaddrs(realIfs);
+        }
+        // 可见隧道数: 走 getifaddrs（被 hook），即游戏视角
+        int visibleCount = 0;
+        struct ifaddrs *visIfs = NULL;
+        if (getifaddrs(&visIfs) == 0) {
+            struct ifaddrs *cur = visIfs;
+            while (cur) {
+                const char *nm = cur->ifa_name ? cur->ifa_name : "";
+                if (strncmp(nm, "utun", 4) == 0 || strncmp(nm, "ipsec", 5) == 0 ||
+                    strncmp(nm, "ppp", 3) == 0 || strncmp(nm, "tun", 3) == 0 ||
+                    strncmp(nm, "tap", 3) == 0) visibleCount++;
+                cur = cur->ifa_next;
+            }
+            freeifaddrs(visIfs);
+        }
+        BOOL vpnActive = (realCount > 0);
+        BOOL hideWorking = (realCount > 0 && visibleCount == 0);
+        NSString *sysStr = [NSString stringWithFormat:@"%lld.%09ld",
+                            (long long)gFakeSysTime.tv_sec, (long)gFakeSysTime.tv_nsec];
+        NSString *bootStr = [NSString stringWithFormat:@"%lld.%06d",
+                             (long long)gFakeBootTime.tv_sec, (int)gFakeBootTime.tv_usec];
+        NSDictionary *status = @{
+            @"plugin": @"fishtweak",
+            @"version": @"2.3.1",
+            @"tweak_enabled": @(gTweakEnabled),
+            @"vpn_hide": @{
+                @"real_tunnel_count": @(realCount),
+                @"visible_tunnel_count": @(visibleCount),
+                @"vpn_active": @(vpnActive),
+                @"hide_working": @(hideWorking)
+            },
+            @"sys_fake": sysStr,
+            @"boot_fake": bootStr,
+            @"idfa": (getOrDeriveUUID() ?: @"(null)")
+        };
+        NSLog(@"[FishTweak] /status: real=%d visible=%d vpnActive=%d hideWorking=%d",
+              realCount, visibleCount, vpnActive, hideWorking);
+        sendLocalHttpResponse(clientSocket, status);
+
     } else {
         sendLocalHttpResponse(clientSocket, @{
-            @"endpoints": @[@"/send_sms?mobile=X&uuid=Y", @"/reset_password?mobile=X&code=Y&password=Z&uuid=Y"]
+            @"endpoints": @[@"/send_sms?mobile=X&uuid=Y",
+                            @"/reset_password?mobile=X&code=Y&password=Z&uuid=Y",
+                            @"/status"]
         });
     }
 }
@@ -437,8 +493,40 @@ static unsigned int my_if_nametoindex(const char *ifname) {
     return orig_if_nametoindex(ifname);
 }
 
+// ---- if_nameindex: 另一种接口枚举途径（v2.3.1 补漏）----
+static struct if_nameindex *(*orig_if_nameindex)(void);
+static struct if_nameindex *my_if_nameindex(void) {
+    struct if_nameindex *ni = orig_if_nameindex();
+    if (!gTweakEnabled || !ni) return ni;
+    for (struct if_nameindex *p = ni; p && p->if_index != 0 && p->if_name; p++) {
+        if (strncmp(p->if_name, "utun", 4) == 0 || strncmp(p->if_name, "ipsec", 5) == 0 ||
+            strncmp(p->if_name, "ppp", 3) == 0 || strncmp(p->if_name, "tun", 3) == 0 ||
+            strncmp(p->if_name, "tap", 3) == 0) {
+            NSLog(@"[FishTweak] if_nameindex 屏蔽: %s", p->if_name);
+            p->if_name[0] = '\0';   // 名字置空, 调用方视为无效接口
+        }
+    }
+    return ni;
+}
+
+// ---- if_indextoname: 索引反查接口名（v2.3.1 补漏）----
+static char *(*orig_if_indextoname)(unsigned int, char *);
+static char *my_if_indextoname(unsigned int ifindex, char *ifname) {
+    char *ret = orig_if_indextoname(ifindex, ifname);
+    if (gTweakEnabled && ret) {
+        if (strncmp(ret, "utun", 4) == 0 || strncmp(ret, "ipsec", 5) == 0 ||
+            strncmp(ret, "ppp", 3) == 0 || strncmp(ret, "tun", 3) == 0 ||
+            strncmp(ret, "tap", 3) == 0) {
+            NSLog(@"[FishTweak] if_indextoname 屏蔽: %s", ret);
+            ifname[0] = '\0';
+            return ifname;
+        }
+    }
+    return ret;
+}
+
 %ctor {
-    NSLog(@"[FishTweak] 插件已加载 v2.3.0");
+    NSLog(@"[FishTweak] 插件已加载 v2.3.1");
     initFakeTimes();
 
     // ---- v2.3: sys/boot 伪造 + VPN 隐藏 ----
@@ -457,7 +545,10 @@ static unsigned int my_if_nametoindex(const char *ifname) {
     }
     MSHookFunction((void *)&getifaddrs, (void *)&my_getifaddrs, (void **)&orig_getifaddrs);
     MSHookFunction((void *)&if_nametoindex, (void *)&my_if_nametoindex, (void **)&orig_if_nametoindex);
-    NSLog(@"[FishTweak] v2.3 hook 就绪: sysctl/stat*/getifaddrs/if_nametoindex");
+    // v2.3.1 补漏: if_nameindex / if_indextoname 也屏蔽隧道接口
+    MSHookFunction((void *)&if_nameindex, (void *)&my_if_nameindex, (void **)&orig_if_nameindex);
+    MSHookFunction((void *)&if_indextoname, (void *)&my_if_indextoname, (void **)&orig_if_indextoname);
+    NSLog(@"[FishTweak] v2.3 hook 就绪: sysctl/stat*/getifaddrs/if_nametoindex/if_nameindex/if_indextoname");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *uuid = getOrDeriveUUID();
