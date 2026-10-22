@@ -88,6 +88,14 @@ static NSString *getOrDeriveUUID(void) {
 //  本地 HTTP 服务 + 游戏API请求（v2.2）
 // ========================================
 
+// ---- v2.3 全局状态的前向声明（正式定义见文件后部）----
+// /status 自检接口在 handleLocalRequest 里引用这些变量，
+// 必须先声明（tentative definition，与后部正式定义合并）
+static struct timeval gFakeBootTime;
+static struct timespec gFakeSysTime;
+static int gTweakEnabled;
+static int (*orig_getifaddrs)(struct ifaddrs **);
+
 static NSString *buildUserAgent(void) {
     NSString *iosVer = [[UIDevice currentDevice] systemVersion];
     CGFloat screenScale = [[UIScreen mainScreen] scale];
