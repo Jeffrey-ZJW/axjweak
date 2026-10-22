@@ -88,13 +88,12 @@ static NSString *getOrDeriveUUID(void) {
 //  本地 HTTP 服务 + 游戏API请求（v2.2）
 // ========================================
 
-// ---- v2.3 全局状态的前向声明（正式定义见文件后部）----
-// /status 自检接口在 handleLocalRequest 里引用这些变量，
-// 必须先声明（tentative definition，与后部正式定义合并）
-static struct timeval gFakeBootTime;
-static struct timespec gFakeSysTime;
-static int gTweakEnabled;
-static int (*orig_getifaddrs)(struct ifaddrs **);
+// ---- v2.3 全局状态定义（移到前部：/status 接口在 handleLocalRequest 中使用，
+//       C++ 无 tentative definition，定义必须先于所有使用点）----
+static struct timeval gFakeBootTime = {0, 0};      // boot 伪值（sysctl kern.boottime）
+static struct timespec gFakeSysTime = {0, 0};      // sys 伪值（MCMeta.plist 的 st_mtime）
+static int gTweakEnabled = 1;                      // 总开关
+static int (*orig_getifaddrs)(struct ifaddrs **);  // getifaddrs 原函数指针
 
 static NSString *buildUserAgent(void) {
     NSString *iosVer = [[UIDevice currentDevice] systemVersion];
@@ -356,9 +355,8 @@ static void *httpAcceptThread(void *arg) {
 // ========================================
 //  SysFileTime + bootTimeInSec 伪造 + VPN 隐藏（v2.3 新增）
 // ========================================
-static struct timeval gFakeBootTime = {0, 0};     // boot 伪值（sysctl kern.boottime）
-static struct timespec gFakeSysTime = {0, 0};     // sys 伪值（MCMeta.plist 的 st_mtime）
-static int gTweakEnabled = 1;                     // 总开关
+// （gFakeBootTime / gFakeSysTime / gTweakEnabled / orig_getifaddrs 定义已上移
+//   到 v2.2 HTTP 服务区顶部，见文件前部，避免 C++ 重复定义）
 
 // 生成成对伪值: boot 必须在 sys 之后（避免"文件创建晚于开机"破绽）
 static void initFakeTimes(void) {
@@ -460,7 +458,7 @@ static int my_lstat64(const char *path, struct stat *st) {
 }
 
 // ---- getifaddrs: 摘除 VPN 隧道接口（utun/ipsec/ppp/tun/tap）----
-static int (*orig_getifaddrs)(struct ifaddrs **);
+// （orig_getifaddrs 定义已上移到前部）
 static int my_getifaddrs(struct ifaddrs **ifap) {
     int ret = orig_getifaddrs(ifap);
     if (!gTweakEnabled || ret != 0 || !ifap || !*ifap) return ret;
