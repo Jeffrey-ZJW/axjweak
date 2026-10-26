@@ -56,9 +56,49 @@ static NSString *findGameBinaryPath(void) {
 }
 
 // ============================================================
-//  拉起游戏（posix_spawn，同 frida spawn 原理，UI 正常显示）
+//  拉起游戏
+//  首选 FBSOpenApplicationService（SpringBoard 标准拉起通道，
+//  不会黑屏/闪退）；失败回退 posix_spawn（日志会标明）
 // ============================================================
 static void launchGame(void) {
+    @try {
+        Class svcClass = NSClassFromString(@"FBSOpenApplicationService");
+        Class infoClass = NSClassFromString(@"FBSApplicationInfo");
+        Class handleClass = NSClassFromString(@"FBSProcessHandle");
+        if (svcClass && infoClass && handleClass) {
+            id svc = [svcClass performSelector:NSSelectorFromString(@"serviceWithDefaultShellEndpoint")];
+            if (svc) {
+                id appInfo = [infoClass performSelector:NSSelectorFromString(@"applicationInfoWithBundleIdentifier:")
+                                             withObject:kGameBundleId];
+                if (appInfo) {
+                    id handle = [handleClass performSelector:NSSelectorFromString(@"processHandleForApplication:")
+                                                  withObject:appInfo];
+                    if (handle) {
+                        id options = [NSClassFromString(@"FBSOpenApplicationOptions")
+                                      performSelector:NSSelectorFromString(@"optionsWithDefaultValues")];
+                        SEL sel = NSSelectorFromString(@"openApplication:withOptions:completion:");
+                        NSMethodSignature *sig = [svc methodSignatureForSelector:sel];
+                        if (sig) {
+                            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                            inv.target = svc;
+                            inv.selector = sel;
+                            [inv setArgument:&handle atIndex:2];
+                            [inv setArgument:&options atIndex:3];
+                            id nilBlock = nil;
+                            [inv setArgument:&nilBlock atIndex:4];
+                            [inv invoke];
+                            NSLog(@"[FishTweakD] FBS 拉起请求已发送 %@", kGameBundleId);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        NSLog(@"[FishTweakD] FBS 类不可用，回退 posix_spawn");
+    } @catch (NSException *e) {
+        NSLog(@"[FishTweakD] FBS 拉起异常: %@", e);
+    }
+    // ---- 兜底：posix_spawn（可能黑屏/闪退，仅作最后手段）----
     NSString *exe = findGameBinaryPath();
     if (!exe) { NSLog(@"[FishTweakD] 未找到游戏(%@)，无法拉起", kGameBundleId); return; }
     pid_t pid = 0;
@@ -74,16 +114,22 @@ static void launchGame(void) {
 // ============================================================
 //  收号落盘（写参数文件，0644 保证游戏进程 mobile 可读）
 // ============================================================
+static NSString *strParam(NSDictionary *p, NSString *key) {
+    id v = p[key];
+    if (!v || [v isKindOfClass:[NSNull class]]) return @"";
+    if ([v isKindOfClass:[NSString class]]) return v;
+    return [v stringValue];
+}
 static void saveAccount(NSDictionary *params) {
     NSMutableDictionary *acct = [NSMutableDictionary dictionaryWithCapacity:8];
-    acct[@"appid"]    = params[@"appid"] ?: @"";
-    acct[@"openid"]   = params[@"openid"] ?: @"";
-    acct[@"refresh"]  = params[@"refresh"] ?: @"";
-    acct[@"token"]    = params[@"token"] ?: @"";
-    acct[@"nickname"] = params[@"nickname"] ?: @"";
-    acct[@"account"]  = params[@"account"] ?: @"";
-    acct[@"phone"]    = params[@"phone"] ?: @"";
-    acct[@"password"] = params[@"password"] ?: @"";
+    acct[@"appid"]    = strParam(params, @"appid");
+    acct[@"openid"]   = strParam(params, @"openid");
+    acct[@"refresh"]  = strParam(params, @"refresh");
+    acct[@"token"]    = strParam(params, @"token");
+    acct[@"nickname"] = strParam(params, @"nickname");
+    acct[@"account"]  = strParam(params, @"account");
+    acct[@"phone"]    = strParam(params, @"phone");
+    acct[@"password"] = strParam(params, @"password");
     BOOL ok = [acct writeToFile:kAccountFile atomically:YES];
     chmod([kAccountFile UTF8String], 0644);
     NSLog(@"[FishTweakD] 账号参数已保存 openid=%@ ok=%d", acct[@"openid"], ok);
@@ -179,12 +225,29 @@ static void sendHttp(int clientSocket, NSDictionary *json) {
     close(clientSocket);
 }
 
-static void handleRequest(int clientSocket, NSString *path) {
+static void handleRequest(int clientSocket, NSString *request) {
+    NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
+    if (lines.count == 0) return;
+    NSArray *parts = [lines.firstObject componentsSeparatedByString:@" "];
+    if (parts.count < 2) return;
+    NSString *path = parts[1];
     NSURLComponents *components = [NSURLComponents componentsWithString:[NSString stringWithFormat:@"http://localhost%@", path]];
     NSString *reqPath = components.path;
     NSMutableDictionary *params = [NSMutableDictionary dictionary];
     for (NSURLQueryItem *item in components.queryItems) {
         params[item.name] = item.value;
+    }
+    // POST JSON body 合并（body 键值优先，兼容 URL 长参数传不全的场景）
+    NSRange hdrEnd = [request rangeOfString:@"\r\n\r\n"];
+    if (hdrEnd.location != NSNotFound) {
+        NSString *body = [request substringFromIndex:hdrEnd.location + 4];
+        if (body.length > 0) {
+            NSData *bd = [body dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:bd options:0 error:nil];
+            if ([json isKindOfClass:[NSDictionary class]]) {
+                for (NSString *k in json) params[k] = json[k];
+            }
+        }
     }
 
     if ([reqPath isEqualToString:@"/send_sms"]) {
@@ -250,7 +313,11 @@ static void handleRequest(int clientSocket, NSString *path) {
         }
         saveAccount(params);
         BOOL doLaunch = YES;
-        if (params[@"launch"] && [params[@"launch"] isEqualToString:@"0"]) doLaunch = NO;
+        id launchVal = params[@"launch"];
+        if (launchVal) {
+            NSString *ls = [launchVal isKindOfClass:[NSString class]] ? launchVal : [launchVal stringValue];
+            if ([ls isEqualToString:@"0"]) doLaunch = NO;
+        }
         if (doLaunch) launchGame();
         sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"launch": @(doLaunch)});
 
@@ -287,17 +354,31 @@ static void *httpThread(void *arg) {
     while (1) {
         int client = accept(s, NULL, NULL);
         if (client < 0) break;
-        char buffer[8192];
-        ssize_t n = recv(client, buffer, sizeof(buffer) - 1, 0);
-        if (n > 0) {
-            buffer[n] = '\0';
-            NSString *request = [NSString stringWithUTF8String:buffer];
-            NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
-            NSArray *parts = [lines.firstObject componentsSeparatedByString:@" "];
-            if (parts.count >= 2) {
-                handleRequest(client, parts[1]);
-                continue;
+        char buffer[16384];
+        ssize_t total = 0;
+        while (total < (ssize_t)sizeof(buffer) - 1) {
+            ssize_t n = recv(client, buffer + total, sizeof(buffer) - 1 - total, 0);
+            if (n <= 0) break;
+            total += n;
+            buffer[total] = '\0';
+            // 判断 header 是否完整，再按 Content-Length 等 body
+            NSString *soFar = [NSString stringWithUTF8String:buffer];
+            NSRange hdrEnd = [soFar rangeOfString:@"\r\n\r\n"];
+            if (hdrEnd.location == NSNotFound) continue;
+            NSInteger contentLength = 0;
+            NSArray *hdrLines = [[soFar substringToIndex:hdrEnd.location] componentsSeparatedByString:@"\r\n"];
+            for (NSString *hl in hdrLines) {
+                if ([[hl lowercaseString] hasPrefix:@"content-length:"]) {
+                    contentLength = [[hl substringFromIndex:15] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]].integerValue;
+                    break;
+                }
             }
+            if (total >= (ssize_t)(hdrEnd.location + 4 + contentLength)) break;
+        }
+        if (total > 0) {
+            buffer[total] = '\0';
+            NSString *request = [NSString stringWithUTF8String:buffer];
+            handleRequest(client, request);
         }
         close(client);
     }
