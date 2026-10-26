@@ -8,9 +8,11 @@ fishtweak_FRAMEWORKS = Foundation UIKit CoreServices AdSupport Security CFNetwor
 fishtweak_LDFLAGS = -lsqlite3
 SUBPROJECTS += daemon
 
-# ---- Ensure DEBIAN maintainer scripts are executable before packaging ----
-# (git/zip upload loses exec bit; dpkg requires >=0555 <=0775) ----
-before-package::
+# ---- Ensure DEBIAN maintainer scripts are executable ----
+# Use before-stage:: (runs BEFORE layout is copied to stage dir, unlike
+# before-package:: which runs after copying and has no effect on the .deb).
+# git/zip upload loses exec bit; dpkg requires >=0555 <=0775.
+before-stage::
 	chmod 755 layout/DEBIAN/postinst layout/DEBIAN/prerm
 	@ls -l layout/DEBIAN/postinst layout/DEBIAN/prerm
 
