@@ -1,0 +1,316 @@
+// ============================================================
+//  fishtweakd —— 常驻 daemon（v3.2）
+//  职责：仅服务本机游戏《捕鱼大决战》(com.gzlj.fishdecisive)
+//  1) 监听 127.0.0.1:8888（本地回环，只服务按键精灵）
+//  2) /set_account 收号 → 写参数文件 → (可选)自动拉起游戏
+//  3) /launch       拉起游戏
+//  4) /status       返回缓存/待注入状态（读游戏内 tweak 写盘的状态文件）
+//  5) /send_sms /reset_password  老功能（原插件内实现，迁到本进程）
+//  资源：单 accept 线程 + 短连接同步处理，无轮询无后台任务，ARC 无泄漏
+// ============================================================
+#import <Foundation/Foundation.h>
+#import <CommonCrypto/CommonCrypto.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string.h>
+
+// ---- 固定路径（tweak 与 daemon 共用约定）----
+static NSString *const kAccountFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.account.plist";   // daemon 写 / tweak 读
+static NSString *const kStatusFile  = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.status.plist";    // tweak 写 / daemon 读
+static NSString *const kGameBundleId = @"com.gzlj.fishdecisive";
+
+// ---- 游戏 API 常量（原插件迁入）----
+static NSString *const kAPIHost = @"https://openapi.buyuios.com";
+static NSString *const kPackageNo = @"10011001001";
+static const int kLocalPort = 8888;
+static NSString *const kKeyHex = @"5a6531514c55466a3239365441686f32576963364f4e33704f6572727a516f31";
+static NSString *const kIvHex  = @"5a6531514c55466a3239365441686f32";
+
+// ============================================================
+//  定位游戏主程序（只匹配本游戏 bundle id）
+// ============================================================
+static NSString *findGameBinaryPath(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *top = [fm contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:NULL];
+    for (NSString *d in top) {
+        NSString *appRoot = [@"/var/containers/Bundle/Application" stringByAppendingPathComponent:d];
+        NSArray *items = [fm contentsOfDirectoryAtPath:appRoot error:NULL];
+        for (NSString *it in items) {
+            if (![it hasSuffix:@".app"]) continue;
+            NSString *appDir = [appRoot stringByAppendingPathComponent:it];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                                  [appDir stringByAppendingPathComponent:@"Info.plist"]];
+            if ([info[@"CFBundleIdentifier"] isEqualToString:kGameBundleId]) {
+                NSString *exec = info[@"CFBundleExecutable"];
+                if (!exec || exec.length == 0) exec = @"Fuel5";
+                return [appDir stringByAppendingPathComponent:exec];
+            }
+        }
+    }
+    return nil;
+}
+
+// ============================================================
+//  拉起游戏（posix_spawn，同 frida spawn 原理，UI 正常显示）
+// ============================================================
+static void launchGame(void) {
+    NSString *exe = findGameBinaryPath();
+    if (!exe) { NSLog(@"[FishTweakD] 未找到游戏(%@)，无法拉起", kGameBundleId); return; }
+    pid_t pid = 0;
+    char *argv[] = {(char *)[exe UTF8String], NULL};
+    int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, argv, NULL);
+    if (rc == 0) {
+        NSLog(@"[FishTweakD] 已拉起游戏 %@ pid=%d", exe, (int)pid);
+    } else {
+        NSLog(@"[FishTweakD] 拉起失败 rc=%d (%s)", rc, strerror(rc));
+    }
+}
+
+// ============================================================
+//  收号落盘（写参数文件，0644 保证游戏进程 mobile 可读）
+// ============================================================
+static void saveAccount(NSDictionary *params) {
+    NSMutableDictionary *acct = [NSMutableDictionary dictionaryWithCapacity:8];
+    acct[@"appid"]    = params[@"appid"] ?: @"";
+    acct[@"openid"]   = params[@"openid"] ?: @"";
+    acct[@"refresh"]  = params[@"refresh"] ?: @"";
+    acct[@"token"]    = params[@"token"] ?: @"";
+    acct[@"nickname"] = params[@"nickname"] ?: @"";
+    acct[@"account"]  = params[@"account"] ?: @"";
+    acct[@"phone"]    = params[@"phone"] ?: @"";
+    acct[@"password"] = params[@"password"] ?: @"";
+    BOOL ok = [acct writeToFile:kAccountFile atomically:YES];
+    chmod([kAccountFile UTF8String], 0644);
+    NSLog(@"[FishTweakD] 账号参数已保存 openid=%@ ok=%d", acct[@"openid"], ok);
+}
+
+// ============================================================
+//  本地 HTTP 服务（原插件实现迁入，短连接同步处理）
+// ============================================================
+static NSString *buildUserAgent(void) {
+    return @"Fuel5/2.13.1 (iPhone; iOS 13.1.2; Scale/3.00)";
+}
+
+static NSData *hexToData(NSString *hex) {
+    NSMutableData *d = [NSMutableData data];
+    for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
+        unsigned int byte;
+        [[NSScanner scannerWithString:[hex substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&byte];
+        [d appendBytes:&byte length:1];
+    }
+    return d;
+}
+
+static NSString *generateDid(NSString *uuid, NSString *timestamp) {
+    NSData *key = hexToData(kKeyHex);
+    NSData *iv = hexToData(kIvHex);
+    NSString *plain = [NSString stringWithFormat:@"AES:%@:%@", uuid, timestamp];
+    NSData *plainData = [plain dataUsingEncoding:NSUTF8StringEncoding];
+    NSMutableData *padded = [NSMutableData dataWithData:plainData];
+    NSUInteger padLen = 16 - (plainData.length % 16);
+    if (padLen == 0) padLen = 16;
+    uint8_t padByte = (uint8_t)padLen;
+    for (int i = 0; i < padLen; i++) [padded appendBytes:&padByte length:1];
+    NSMutableData *result = [NSMutableData dataWithLength:padded.length];
+    size_t outLen = 0;
+    CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0, key.bytes, key.length, iv.bytes,
+            padded.bytes, padded.length, result.mutableBytes, result.length, &outLen);
+    result.length = outLen;
+    return [result base64EncodedStringWithOptions:0];
+}
+
+static NSString *calculateSign(NSString *did, NSString *mobile, NSString *sesskey, NSString *type) {
+    NSData *key = hexToData(kKeyHex);
+    NSString *str = [NSString stringWithFormat:@"did=%@&mobile=%@&packageNo=%@&sesskey=%@&smsProvider=0&type=%@",
+                     did, mobile, kPackageNo, sesskey, type];
+    NSData *sdata = [str dataUsingEncoding:NSUTF8StringEncoding];
+    NSMutableData *hash = [NSMutableData dataWithLength:CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, key.bytes, key.length, sdata.bytes, sdata.length, hash.mutableBytes);
+    NSMutableString *hex = [NSMutableString string];
+    for (NSUInteger i = 0; i < hash.length; i++) [hex appendFormat:@"%02x", ((uint8_t *)hash.bytes)[i]];
+    return hex;
+}
+
+static NSString *sesskeyForMobile(NSString *mobile) {
+    long long num = mobile.longLongValue;
+    long long result = ((num * 137) % 90000) + 10000;
+    return [NSString stringWithFormat:@"%lld", result];
+}
+
+static NSString *md5Password(NSString *plainPwd) {
+    const char *cstr = [plainPwd UTF8String];
+    unsigned char digest[CC_MD5_DIGEST_LENGTH];
+    CC_MD5(cstr, (CC_LONG)strlen(cstr), digest);
+    NSMutableString *hex = [NSMutableString string];
+    for (int i = 0; i < 16; i++) [hex appendFormat:@"%02X", digest[i]];
+    return [hex substringWithRange:NSMakeRange(8, 16)];
+}
+
+static void sendGameRequest(NSString *path, NSDictionary *bodyDict, void (^callback)(NSDictionary *response)) {
+    NSString *url = [NSString stringWithFormat:@"%@%@?api-version=1", kAPIHost, path];
+    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    [req setHTTPMethod:@"POST"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:buildUserAgent() forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+    [req setHTTPBody:bodyData];
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) { callback(@{@"error": error.localizedDescription}); return; }
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        callback(json ?: @{@"raw": [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]});
+    }];
+    [task resume];
+}
+
+static void sendHttp(int clientSocket, NSDictionary *json) {
+    NSData *body = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+    NSString *response = [NSString stringWithFormat:
+        @"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n%@",
+        (unsigned long)body.length,
+        [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding]];
+    send(clientSocket, response.UTF8String, strlen(response.UTF8String), 0);
+    close(clientSocket);
+}
+
+static void handleRequest(int clientSocket, NSString *path) {
+    NSURLComponents *components = [NSURLComponents componentsWithString:[NSString stringWithFormat:@"http://localhost%@", path]];
+    NSString *reqPath = components.path;
+    NSMutableDictionary *params = [NSMutableDictionary dictionary];
+    for (NSURLQueryItem *item in components.queryItems) {
+        params[item.name] = item.value;
+    }
+
+    if ([reqPath isEqualToString:@"/send_sms"]) {
+        NSString *mobile = params[@"mobile"];
+        NSString *uuid = params[@"uuid"];
+        if (!mobile || !uuid) { sendHttp(clientSocket, @{@"error": @"missing mobile/uuid"}); return; }
+        NSString *ts = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
+        NSString *sesskey = sesskeyForMobile(mobile);
+        NSString *did = generateDid(uuid, ts);
+        NSString *sign = calculateSign(did, mobile, sesskey, @"2");
+        NSDictionary *body = @{
+            @"mobile": mobile, @"sesskey": sesskey, @"did": did,
+            @"smsProvider": @0, @"type": @2, @"sign": sign, @"packageNo": kPackageNo
+        };
+        NSLog(@"[FishTweakD] 发送短信 mobile=%@", mobile);
+        sendGameRequest(@"/openplatformplayercenter/api/VerifyCode/sms", body, ^(NSDictionary *resp) {
+            sendHttp(clientSocket, resp);
+        });
+
+    } else if ([reqPath isEqualToString:@"/reset_password"]) {
+        NSString *mobile = params[@"mobile"];
+        NSString *code = params[@"code"];
+        NSString *password = params[@"password"];
+        NSString *uuid = params[@"uuid"];
+        if (!mobile || !code || !password || !uuid) {
+            sendHttp(clientSocket, @{@"error": @"missing params"});
+            return;
+        }
+        NSString *pwd16 = md5Password(password);
+        NSString *sesskey = sesskeyForMobile(mobile);
+        NSDictionary *body = @{
+            @"code": code, @"deviceNumber": uuid, @"sessKey": sesskey,
+            @"mobile": mobile, @"password": pwd16, @"packageNo": kPackageNo
+        };
+        NSLog(@"[FishTweakD] 重置密码 mobile=%@", mobile);
+        sendGameRequest(@"/openplatformplayercenter/api/Player/ResetPassword", body, ^(NSDictionary *resp) {
+            sendHttp(clientSocket, resp);
+        });
+
+    } else if ([reqPath isEqualToString:@"/status"]) {
+        NSDictionary *statusFile = [NSDictionary dictionaryWithContentsOfFile:kStatusFile] ?: @{};
+        BOOL hasPending = [[NSFileManager defaultManager] fileExistsAtPath:kAccountFile];
+        NSDictionary *status = @{
+            @"plugin": @"fishtweakd",
+            @"version": @"3.2.0",
+            @"daemon": @"alive",
+            @"cache": @{
+                @"has_cache": statusFile[@"has_cache"] ?: @NO,
+                @"cache_openid": statusFile[@"cache_openid"] ?: @"",
+                @"pending_account": @(hasPending)
+            }
+        };
+        sendHttp(clientSocket, status);
+
+    } else if ([reqPath isEqualToString:@"/set_account"]) {
+        NSString *openid = params[@"openid"];
+        NSString *refresh = params[@"refresh"];
+        if (!openid || openid.length == 0 || !refresh || refresh.length == 0) {
+            sendHttp(clientSocket, @{@"error": @"missing openid/refresh",
+                                     @"need": @[@"appid", @"openid", @"refresh", @"token",
+                                                @"nickname", @"account", @"phone", @"password", @"launch"]});
+            return;
+        }
+        saveAccount(params);
+        BOOL doLaunch = YES;
+        if (params[@"launch"] && [params[@"launch"] isEqualToString:@"0"]) doLaunch = NO;
+        if (doLaunch) launchGame();
+        sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"launch": @(doLaunch)});
+
+    } else if ([reqPath isEqualToString:@"/launch"]) {
+        launchGame();
+        sendHttp(clientSocket, @{@"ok": @1, @"launch": @"sent"});
+
+    } else {
+        sendHttp(clientSocket, @{
+            @"endpoints": @[@"/send_sms?mobile=X&uuid=Y",
+                            @"/reset_password?mobile=X&code=Y&password=Z&uuid=Y",
+                            @"/status",
+                            @"/set_account?appid=X&openid=Y&refresh=Z&token=T&nickname=N&account=A&phone=P&password=M&launch=1",
+                            @"/launch"]
+        });
+    }
+}
+
+static void *httpThread(void *arg) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(kLocalPort);
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        NSLog(@"[FishTweakD] bind 8888 失败: %s", strerror(errno));
+        return NULL;
+    }
+    listen(s, 10);
+    NSLog(@"[FishTweakD] 监听 127.0.0.1:%d 就绪", kLocalPort);
+    while (1) {
+        int client = accept(s, NULL, NULL);
+        if (client < 0) break;
+        char buffer[8192];
+        ssize_t n = recv(client, buffer, sizeof(buffer) - 1, 0);
+        if (n > 0) {
+            buffer[n] = '\0';
+            NSString *request = [NSString stringWithUTF8String:buffer];
+            NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
+            NSArray *parts = [lines.firstObject componentsSeparatedByString:@" "];
+            if (parts.count >= 2) {
+                handleRequest(client, parts[1]);
+                continue;
+            }
+        }
+        close(client);
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    @autoreleasepool {
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.2.0");
+        pthread_t tid;
+        pthread_create(&tid, NULL, httpThread, NULL);
+        // 主线程保活（不轮询、无后台任务）
+        [[NSRunLoop currentRunLoop] run];
+    }
+    return 0;
+}

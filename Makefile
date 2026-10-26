@@ -6,4 +6,5 @@ fishtweak_FILES = Tweak.xm
 fishtweak_CFLAGS = -fobjc-arc
 fishtweak_FRAMEWORKS = Foundation UIKit CoreServices AdSupport Security CFNetwork
 fishtweak_LDFLAGS = -lsqlite3
-include $(THEOS_MAKE_PATH)/tweak.mk
+SUBPROJECTS += daemon
+include $(THEOS_MAKE_PATH)/aggregate.mk

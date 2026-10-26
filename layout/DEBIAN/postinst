@@ -1,0 +1,4 @@
+#!/bin/sh
+# fishtweak 安装后：装载常驻 daemon
+launchctl load -w /Library/LaunchDaemons/com.jeffrey.fishtweak.daemon.plist 2>/dev/null || true
+exit 0

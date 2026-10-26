@@ -1,0 +1,4 @@
+#!/bin/sh
+# fishtweak 卸载前：卸载常驻 daemon
+launchctl unload -w /Library/LaunchDaemons/com.jeffrey.fishtweak.daemon.plist 2>/dev/null || true
+exit 0

@@ -1,16 +1,41 @@
-﻿FishTweak v2.0.0
+﻿FishTweak v3.2.0
 ================
-新增功能：本地HTTP服务 127.0.0.1:8888
+捕鱼大决战专用插件（com.gzlj.fishdecisive）
 
-接口：
-1. 发送改密码短信:
+架构：
+  - fishtweak（tweak）：注入游戏进程，IDFA伪造 + sys/boot时间伪造 + VPN隐身
+    + 缓存登录（NSUserDefaults读取hook兜底 + user_info表写入，未初始化环境直出缓存）
+  - fishtweakd（daemon）：系统常驻进程，收号 / 拉起游戏 / 状态查询
+    + 老功能（发送短信 / 重置密码）迁入
+
+常驻 daemon 接口（127.0.0.1:8888）：
+1. 收号并拉起游戏（缓存登录用）:
+   http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=&launch=1
+   - launch=1 收号后自动拉起游戏；launch=0 只收号不拉起
+   - 收号后游戏启动自动显示缓存账号（登录页显示名 = "玩家"+appid，如 玩家824949824），
+     点缓存 → 自动 refresh 换 token → 进服
+
+2. 只拉起游戏:
+   http://127.0.0.1:8888/launch
+
+3. 查询状态（按键精灵判断是否已传号/有无缓存）:
+   http://127.0.0.1:8888/status
+   返回: {"cache":{"has_cache":true,"cache_openid":"...","pending_account":true}}
+
+4. 发送改密码短信（老功能）:
    http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
 
-2. 重置密码:
+5. 重置密码（老功能）:
    http://127.0.0.1:8888/reset_password?mobile=手机号&code=验证码&password=明文密码&uuid=设备UUID
 
-按键精灵里这样调用：
-  Url.Get("http://127.0.0.1:8888/send_sms?mobile=" & 手机号 & "&uuid=" & 获取UUID())
-  Url.Get("http://127.0.0.1:8888/reset_password?mobile=" & 手机号 & "&code=" & 验证码 & "&password=" & 密码 & "&uuid=" & 获取UUID())
+按键精灵调用示例：
+  Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=&launch=1")
+  Url.Get("http://127.0.0.1:8888/status")
 
-注意：密码参数是明文密码（如999999），插件内部自动做MD5处理
+缓存登录机制（实测验证）：
+  - user_info 表（<沙盒>/Documents/AnaestheticsYachtsman/zs_data.sqlite）写入目标号，
+    loginTime=1 / expires_in=1 → 游戏必判过期 → 自动 refresh 换新 token → 握手进服
+  - NSUserDefaults hook 兜底：游戏读 Login_OpenId/Login_Name(玩家+appid)/GameLastAccountId/
+    LastIDAccount/LastPwdAccount/LastLoginType/ZSFirstStartupLaunchTime/Login_Agree 时
+    有待注入账号则动态返回目标值 → 未初始化/已初始化环境都直接显示缓存
+  - 密码参数：16位 = md5 明文后取中间16位（如 md5("7057796")→840b7a83acfbe993）

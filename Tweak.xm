@@ -85,299 +85,18 @@ static NSString *getOrDeriveUUID(void) {
 }
 %end
 
-// ========================================
-//  本地 HTTP 服务 + 游戏API请求（v2.2）
-// ========================================
-
-// ---- v2.3 全局状态定义（移到前部：/status 接口在 handleLocalRequest 中使用，
-//       C++ 无 tentative definition，定义必须先于所有使用点）----
+// ---- 全局状态定义（sysboot/VPN 使用，必须先于所有使用点）----
 static struct timeval gFakeBootTime = {0, 0};      // boot 伪值（sysctl kern.boottime）
 static struct timespec gFakeSysTime = {0, 0};      // sys 伪值（MCMeta.plist 的 st_mtime）
 static int gTweakEnabled = 1;                      // 总开关
 static int (*orig_getifaddrs)(struct ifaddrs **);  // getifaddrs 原函数指针
-
-// v3.0 缓存登录模块前置声明（handleLocalRequest 在定义前调用 savePendingAccount）
-static void savePendingAccount(NSDictionary *params);
-
-static NSString *buildUserAgent(void) {
-    NSString *iosVer = [[UIDevice currentDevice] systemVersion];
-    CGFloat screenScale = [[UIScreen mainScreen] scale];
-    NSString *scaleStr = (screenScale > 2.5) ? @"3.00" : @"2.00";
-    return [NSString stringWithFormat:@"Fuel5/2.13.1 (iPhone; iOS %@; Scale/%@)", iosVer, scaleStr];
-}
-
-static NSString *const kAPIHost = @"https://openapi.buyuios.com";
-static NSString *const kPackageNo = @"10011001001";
-static const int kLocalPort = 8888;
-static NSString *const kKeyHex = @"5a6531514c55466a3239365441686f32576963364f4e33704f6572727a516f31";
-static NSString *const kIvHex  = @"5a6531514c55466a3239365441686f32";
-
-static NSData *hexToData(NSString *hex) {
-    NSMutableData *d = [NSMutableData data];
-    for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
-        unsigned int byte;
-        [[NSScanner scannerWithString:[hex substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&byte];
-        [d appendBytes:&byte length:1];
-    }
-    return d;
-}
-
-static NSString *generateDid(NSString *uuid, NSString *timestamp) {
-    NSData *key = hexToData(kKeyHex);
-    NSData *iv = hexToData(kIvHex);
-    NSString *plain = [NSString stringWithFormat:@"AES:%@:%@", uuid, timestamp];
-    NSData *plainData = [plain dataUsingEncoding:NSUTF8StringEncoding];
-    NSMutableData *padded = [NSMutableData dataWithData:plainData];
-    NSUInteger padLen = 16 - (plainData.length % 16);
-    if (padLen == 0) padLen = 16;
-    uint8_t padByte = (uint8_t)padLen;
-    for (int i = 0; i < padLen; i++) [padded appendBytes:&padByte length:1];
-    NSMutableData *result = [NSMutableData dataWithLength:padded.length];
-    size_t outLen = 0;
-    CCCrypt(kCCEncrypt, kCCAlgorithmAES, 0,
-            key.bytes, key.length, iv.bytes,
-            padded.bytes, padded.length,
-            result.mutableBytes, result.length, &outLen);
-    result.length = outLen;
-    return [result base64EncodedStringWithOptions:0];
-}
-
-static NSString *calculateSign(NSString *did, NSString *mobile, NSString *sesskey, NSString *type) {
-    NSData *key = hexToData(kKeyHex);
-    NSString *str = [NSString stringWithFormat:@"did=%@&mobile=%@&packageNo=%@&sesskey=%@&smsProvider=0&type=%@",
-                     did, mobile, kPackageNo, sesskey, type];
-    NSMutableData *hash = [NSMutableData dataWithLength:CC_SHA256_DIGEST_LENGTH];
-    CCHmac(kCCHmacAlgSHA256, key.bytes, key.length,
-           [str dataUsingEncoding:NSUTF8StringEncoding].bytes,
-           [str dataUsingEncoding:NSUTF8StringEncoding].length,
-           hash.mutableBytes);
-    NSMutableString *hex = [NSMutableString string];
-    for (NSUInteger i = 0; i < hash.length; i++) {
-        [hex appendFormat:@"%02x", ((uint8_t *)hash.bytes)[i]];
-    }
-    return hex;
-}
-
-static NSString *sesskeyForMobile(NSString *mobile) {
-    long long num = mobile.longLongValue;
-    long long result = ((num * 137) % 90000) + 10000;
-    return [NSString stringWithFormat:@"%lld", result];
-}
-
-static NSString *md5Password(NSString *plainPwd) {
-    const char *cstr = [plainPwd UTF8String];
-    unsigned char digest[CC_MD5_DIGEST_LENGTH];
-    CC_MD5(cstr, (CC_LONG)strlen(cstr), digest);
-    NSMutableString *hex = [NSMutableString string];
-    for (int i = 0; i < 16; i++) [hex appendFormat:@"%02X", digest[i]];
-    return [hex substringWithRange:NSMakeRange(8, 16)];
-}
-
-static void sendGameRequest(NSString *path, NSDictionary *bodyDict, void (^callback)(NSDictionary *response)) {
-    NSString *url = [NSString stringWithFormat:@"%@%@?api-version=1", kAPIHost, path];
-    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
-    [req setHTTPMethod:@"POST"];
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [req setValue:buildUserAgent() forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    [req setValue:@"br, gzip, deflate" forHTTPHeaderField:@"Accept-Encoding"];
-    [req setValue:@"zh-Hans;q=1, en;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-    [req setHTTPBody:bodyData];
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error) { callback(@{@"error": error.localizedDescription}); return; }
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        callback(json ?: @{@"raw": [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]});
-    }];
-    [task resume];
-}
-
-static void sendLocalHttpResponse(int clientSocket, NSDictionary *json) {
-    NSData *body = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-    NSString *response = [NSString stringWithFormat:
-        @"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n%@",
-        (unsigned long)body.length,
-        [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding]];
-    send(clientSocket, response.UTF8String, strlen(response.UTF8String), 0);
-    close(clientSocket);
-}
-
-static void handleLocalRequest(int clientSocket, NSString *path) {
-    NSURLComponents *components = [NSURLComponents componentsWithString:[NSString stringWithFormat:@"http://localhost%@", path]];
-    NSString *reqPath = components.path;
-    NSMutableDictionary *params = [NSMutableDictionary dictionary];
-    for (NSURLQueryItem *item in components.queryItems) {
-        params[item.name] = item.value;
-    }
-
-    if ([reqPath isEqualToString:@"/send_sms"]) {
-        NSString *mobile = params[@"mobile"];
-        NSString *uuid = params[@"uuid"];
-        if (!mobile || !uuid) { sendLocalHttpResponse(clientSocket, @{@"error": @"missing mobile/uuid"}); return; }
-
-        NSString *ts = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
-        NSString *sesskey = sesskeyForMobile(mobile);
-        NSString *did = generateDid(uuid, ts);
-        NSString *sign = calculateSign(did, mobile, sesskey, @"2");
-
-        NSDictionary *body = @{
-            @"mobile": mobile,
-            @"sesskey": sesskey,
-            @"did": did,
-            @"smsProvider": @0,
-            @"type": @2,
-            @"sign": sign,
-            @"packageNo": kPackageNo
-        };
-        NSLog(@"[FishHttp] 发送短信 mobile=%@ sesskey=%@", mobile, sesskey);
-        sendGameRequest(@"/openplatformplayercenter/api/VerifyCode/sms", body, ^(NSDictionary *resp) {
-            NSLog(@"[FishHttp] 短信响应: %@", resp);
-            sendLocalHttpResponse(clientSocket, resp);
-        });
-
-    } else if ([reqPath isEqualToString:@"/reset_password"]) {
-        NSString *mobile = params[@"mobile"];
-        NSString *code = params[@"code"];
-        NSString *password = params[@"password"];
-        NSString *uuid = params[@"uuid"];
-        if (!mobile || !code || !password || !uuid) {
-            sendLocalHttpResponse(clientSocket, @{@"error": @"missing params"});
-            return;
-        }
-        NSString *pwd16 = md5Password(password);
-        NSString *sesskey = sesskeyForMobile(mobile);
-        NSDictionary *body = @{
-            @"code": code,
-            @"deviceNumber": uuid,
-            @"sessKey": sesskey,
-            @"mobile": mobile,
-            @"password": pwd16,
-            @"packageNo": kPackageNo
-        };
-        NSLog(@"[FishHttp] 重置密码 mobile=%@ code=%@", mobile, code);
-        sendGameRequest(@"/openplatformplayercenter/api/Player/ResetPassword", body, ^(NSDictionary *resp) {
-            NSLog(@"[FishHttp] 重置密码响应: %@", resp);
-            sendLocalHttpResponse(clientSocket, resp);
-        });
-
-    } else if ([reqPath isEqualToString:@"/status"]) {
-        // ============ 自检接口: 验证插件生效 + VPN 隐藏 + sys/boot 伪造 ============
-        // 真实隧道数: 走 orig_getifaddrs（绕过 hook），看系统实际有没有隧道
-        int realCount = 0;
-        struct ifaddrs *realIfs = NULL;
-        if (orig_getifaddrs && orig_getifaddrs(&realIfs) == 0) {
-            struct ifaddrs *cur = realIfs;
-            while (cur) {
-                const char *nm = cur->ifa_name ? cur->ifa_name : "";
-                if (strncmp(nm, "utun", 4) == 0 || strncmp(nm, "ipsec", 5) == 0 ||
-                    strncmp(nm, "ppp", 3) == 0 || strncmp(nm, "tun", 3) == 0 ||
-                    strncmp(nm, "tap", 3) == 0) realCount++;
-                cur = cur->ifa_next;
-            }
-            freeifaddrs(realIfs);
-        }
-        // 可见隧道数: 走 getifaddrs（被 hook），即游戏视角
-        int visibleCount = 0;
-        struct ifaddrs *visIfs = NULL;
-        if (getifaddrs(&visIfs) == 0) {
-            struct ifaddrs *cur = visIfs;
-            while (cur) {
-                const char *nm = cur->ifa_name ? cur->ifa_name : "";
-                if (strncmp(nm, "utun", 4) == 0 || strncmp(nm, "ipsec", 5) == 0 ||
-                    strncmp(nm, "ppp", 3) == 0 || strncmp(nm, "tun", 3) == 0 ||
-                    strncmp(nm, "tap", 3) == 0) visibleCount++;
-                cur = cur->ifa_next;
-            }
-            freeifaddrs(visIfs);
-        }
-        BOOL vpnActive = (realCount > 0);
-        BOOL hideWorking = (realCount > 0 && visibleCount == 0);
-        NSString *sysStr = [NSString stringWithFormat:@"%lld.%09ld",
-                            (long long)gFakeSysTime.tv_sec, (long)gFakeSysTime.tv_nsec];
-        NSString *bootStr = [NSString stringWithFormat:@"%lld.%06d",
-                             (long long)gFakeBootTime.tv_sec, (int)gFakeBootTime.tv_usec];
-        NSDictionary *status = @{
-            @"plugin": @"fishtweak",
-            @"version": @"2.3.1",
-            @"tweak_enabled": @(gTweakEnabled),
-            @"vpn_hide": @{
-                @"real_tunnel_count": @(realCount),
-                @"visible_tunnel_count": @(visibleCount),
-                @"vpn_active": @(vpnActive),
-                @"hide_working": @(hideWorking)
-            },
-            @"sys_fake": sysStr,
-            @"boot_fake": bootStr,
-            @"idfa": (getOrDeriveUUID() ?: @"(null)")
-        };
-        NSLog(@"[FishTweak] /status: real=%d visible=%d vpnActive=%d hideWorking=%d",
-              realCount, visibleCount, vpnActive, hideWorking);
-        sendLocalHttpResponse(clientSocket, status);
-
-    } else if ([reqPath isEqualToString:@"/set_account"]) {
-        // ============ 缓存登录接口: 按键精灵传账号参数（落盘待注入） ============
-        // 参数与 app_长久版.py 下载接口返回字段一致:
-        //   appid / openid / refresh(refreshtoken) / token / nickname / account / phone / password(md5)
-        NSString *openid = params[@"openid"];
-        NSString *refresh = params[@"refresh"];
-        if (!openid || openid.length == 0 || !refresh || refresh.length == 0) {
-            sendLocalHttpResponse(clientSocket, @{@"error": @"missing openid/refresh",
-                                                  @"need": @[@"appid", @"openid", @"refresh", @"token",
-                                                             @"nickname", @"account", @"phone", @"password"]});
-            return;
-        }
-        savePendingAccount(params);
-        NSLog(@"[CacheLogin] /set_account 收到并保存: appid=%@ openid=%@", params[@"appid"], openid);
-        sendLocalHttpResponse(clientSocket, @{@"ok": @1, @"saved": openid});
-
-    } else {
-        sendLocalHttpResponse(clientSocket, @{
-            @"endpoints": @[@"/send_sms?mobile=X&uuid=Y",
-                            @"/reset_password?mobile=X&code=Y&password=Z&uuid=Y",
-                            @"/status",
-                            @"/set_account?appid=X&openid=Y&refresh=Z&token=T&nickname=N&account=A&phone=P&password=M"]
-        });
-    }
-}
-
-static void *httpAcceptThread(void *arg) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    int yes = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(kLocalPort);
-    bind(s, (struct sockaddr *)&addr, sizeof(addr));
-    listen(s, 10);
-    NSLog(@"[FishHttp] 监听 127.0.0.1:%d", kLocalPort);
-
-    while (YES) {
-        int client = accept(s, NULL, NULL);
-        if (client < 0) break;
-        char buffer[8192];
-        ssize_t n = recv(client, buffer, sizeof(buffer) - 1, 0);
-        if (n > 0) {
-            buffer[n] = '\0';
-            NSString *request = [NSString stringWithUTF8String:buffer];
-            NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
-            NSArray *parts = [lines.firstObject componentsSeparatedByString:@" "];
-            if (parts.count >= 2) {
-                handleLocalRequest(client, parts[1]);
-                continue;
-            }
-        }
-        close(client);
-    }
-    return NULL;
-}
-
+// 缓存登录模块前置声明（HTTP 已迁 daemon，本进程仅保留文件通道所需）
+static NSDictionary *loadPendingAccount(void);
+static BOOL userInfoHasOpenId(NSString *openId);
 // ========================================
 //  SysFileTime + bootTimeInSec 伪造 + VPN 隐藏（v2.3 新增）
 // ========================================
-// （gFakeBootTime / gFakeSysTime / gTweakEnabled / orig_getifaddrs 定义已上移
-//   到 v2.2 HTTP 服务区顶部，见文件前部，避免 C++ 重复定义）
+// （gFakeBootTime / gFakeSysTime / gTweakEnabled / orig_getifaddrs 定义见前部）
 
 // 生成成对伪值: boot 必须在 sys 之后（避免"文件创建晚于开机"破绽）
 static void initFakeTimes(void) {
@@ -563,49 +282,37 @@ static char *my_if_indextoname(unsigned int ifindex, char *ifname) {
 //              LastLoginType=3 / LastIDAccount=phone / LastPwdAccount=password(md5)
 //    user_info: loginTime=1 / expires_in=1 → 游戏必判过期 → 强制 refresh 换新 token
 // ========================================
-static NSString *const kCachePrefsSuite = @"com.jeffrey.fishtweak.cache";
-
-static void savePendingAccount(NSDictionary *params) {
-    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kCachePrefsSuite];
-    [ud setObject:params[@"appid"] ?: @"" forKey:@"pending_appid"];
-    [ud setObject:params[@"openid"] ?: @"" forKey:@"pending_openid"];
-    [ud setObject:params[@"refresh"] ?: @"" forKey:@"pending_refresh"];
-    [ud setObject:params[@"token"] ?: @"" forKey:@"pending_token"];
-    [ud setObject:params[@"nickname"] ?: @"" forKey:@"pending_nickname"];
-    [ud setObject:params[@"account"] ?: @"" forKey:@"pending_account"];
-    [ud setObject:params[@"phone"] ?: @"" forKey:@"pending_phone"];
-    [ud setObject:params[@"password"] ?: @"" forKey:@"pending_password"];
-    [ud synchronize];
-}
+// ========================================
+//  缓存登录（v3.1 新增）—— 免验证码进服（文件通道版）
+//  流程：daemon(fishtweakd) 常驻 8888 收号 → 写参数文件
+//        → 按键精灵传号后 daemon 自动拉起游戏
+//        → 游戏启动后 2.5s 做一次检查：
+//        → user_info 已有缓存记录 → 不介入，游戏自动跑缓存登录（过期会自动 refresh）
+//        → 无缓存记录 → 读参数文件写 defaults + user_info 制造缓存 → 删参数文件
+//  写入公式与 frida V18(defaults)/V21(user_info) 实证完全一致：
+//    defaults: Login_OpenId=openid / Login_Name=appid / GameLastAccountId=appid
+//              LastLoginType=3 / LastIDAccount=phone / LastPwdAccount=password(md5)
+//    user_info: loginTime=1 / expires_in=1 → 游戏必判过期 → 强制 refresh 换新 token
+// ========================================
+// 与 daemon(fishtweakd) 约定共享的固定路径
+static NSString *const kAccountFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.account.plist";  // daemon 写 / tweak 读
+static NSString *const kStatusFile  = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.status.plist";   // tweak 写 / daemon 读
 
 static NSDictionary *loadPendingAccount(void) {
-    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kCachePrefsSuite];
-    NSString *openid = [ud stringForKey:@"pending_openid"];
-    if (!openid || openid.length == 0) return nil;
-    return @{
-        @"appid":    [ud stringForKey:@"pending_appid"] ?: @"",
-        @"openid":   openid,
-        @"refresh":  [ud stringForKey:@"pending_refresh"] ?: @"",
-        @"token":    [ud stringForKey:@"pending_token"] ?: @"",
-        @"nickname": [ud stringForKey:@"pending_nickname"] ?: @"",
-        @"account":  [ud stringForKey:@"pending_account"] ?: @"",
-        @"phone":    [ud stringForKey:@"pending_phone"] ?: @"",
-        @"password": [ud stringForKey:@"pending_password"] ?: @""
-    };
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kAccountFile];
+    if (!d || ![d[@"openid"] length] || ![d[@"refresh"] length]) return nil;
+    return d;
 }
 
 static void clearPendingAccount(void) {
-    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kCachePrefsSuite];
-    [ud removeObjectForKey:@"pending_appid"];
-    [ud removeObjectForKey:@"pending_openid"];
-    [ud removeObjectForKey:@"pending_refresh"];
-    [ud removeObjectForKey:@"pending_token"];
-    [ud removeObjectForKey:@"pending_nickname"];
-    [ud removeObjectForKey:@"pending_account"];
-    [ud removeObjectForKey:@"pending_phone"];
-    [ud removeObjectForKey:@"pending_password"];
-    [ud synchronize];
-    NSLog(@"[CacheLogin] 待注入参数已清除");
+    [[NSFileManager defaultManager] removeItemAtPath:kAccountFile error:NULL];
+    NSLog(@"[CacheLogin] 参数文件已删除");
+}
+
+// 状态写盘（daemon 的 /status 接口读取，按键精灵据此判断是否传号）
+static void writeStatus(NSString *curOpenId, BOOL hasCache) {
+    NSDictionary *s = @{@"has_cache": @(hasCache), @"cache_openid": curOpenId ?: @""};
+    [s writeToFile:kStatusFile atomically:YES];
 }
 
 static NSString *cacheDbPath(void) {
@@ -635,19 +342,22 @@ static BOOL userInfoHasOpenId(NSString *openId) {
     return found;
 }
 
-// 写游戏域 defaults（登录页显示名 = appid 纯数字，nickName 保持"用户XXXX"由 user_info 决定）
+// 写游戏域 defaults（登录页显示名 = "玩家"+appid，nickName 保持"用户XXXX"由 user_info 决定）
+// v3.2: 补齐 ZSFirstStartupLaunchTime(当前时间戳) + Login_Agree(1) —— 未初始化环境直接骗过"首启判定"
 static void writeLoginDefaults(NSDictionary *acct) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setObject:acct[@"openid"] forKey:@"Login_OpenId"];
-    [ud setObject:acct[@"appid"] forKey:@"Login_Name"];
+    [ud setObject:[NSString stringWithFormat:@"玩家%@", acct[@"appid"]] forKey:@"Login_Name"];
     [ud setObject:acct[@"appid"] forKey:@"GameLastAccountId"];
     [ud setInteger:3 forKey:@"LastLoginType"];
     NSString *lastId = acct[@"phone"];
     if (!lastId || lastId.length == 0) lastId = acct[@"account"];
     [ud setObject:lastId forKey:@"LastIDAccount"];
     [ud setObject:acct[@"password"] forKey:@"LastPwdAccount"];
+    [ud setObject:@((long long)[[NSDate date] timeIntervalSince1970]) forKey:@"ZSFirstStartupLaunchTime"];
+    [ud setObject:@1 forKey:@"Login_Agree"];
     [ud synchronize];
-    NSLog(@"[CacheLogin] defaults 已写回(%@/%@)", acct[@"appid"], lastId);
+    NSLog(@"[CacheLogin] defaults 已写回(玩家%@/%@)", acct[@"appid"], lastId);
 }
 
 // 写 user_info（loginTime=1/expires_in=1 → 游戏必判过期 → refresh 换新 token）
@@ -684,32 +394,117 @@ static void makeCacheLogin(NSDictionary *acct) {
     NSLog(@"[CacheLogin] ★ 缓存登录已制造 appid=%@", acct[@"appid"]);
 }
 
-// 启动检查：有缓存(user_info 有记录) → 不介入；无缓存 → 有参数则制造
+// ========================================
+//  v3.2 新增：NSUserDefaults 读取 hook（frida 实证方案，任何环境/时机都显示缓存）
+//  有待注入账号参数时（参数文件存在）：
+//    ZSFirstStartupLaunchTime → 当前时间戳（骗过"首次启动"判定，未初始化环境直出缓存）
+//    Login_Agree → 1 / LastLoginType → 3
+//    Login_OpenId / Login_Name("玩家"+appid) / GameLastAccountId / LastIDAccount / LastPwdAccount → 目标值
+//  无参数文件时全部走原实现（零干扰）
+// ========================================
+%hook NSUserDefaults
+- (id)objectForKey:(NSString *)defaultName {
+    id v = %orig;
+    @try {
+        NSDictionary *pending = loadPendingAccount();
+        if (!pending) return v;
+        NSString *k = defaultName ?: @"";
+        if ([k isEqualToString:@"Login_OpenId"]) {
+            return pending[@"openid"] ?: v;
+        } else if ([k isEqualToString:@"Login_Name"]) {
+            NSString *appid = pending[@"appid"];
+            if (appid && appid.length > 0) return [NSString stringWithFormat:@"玩家%@", appid];
+        } else if ([k isEqualToString:@"GameLastAccountId"]) {
+            return pending[@"appid"] ?: v;
+        } else if ([k isEqualToString:@"LastIDAccount"]) {
+            NSString *ph = pending[@"phone"];
+            if (!ph || ph.length == 0) ph = pending[@"account"];
+            return ph ?: v;
+        } else if ([k isEqualToString:@"LastPwdAccount"]) {
+            return pending[@"password"] ?: v;
+        } else if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
+            return @((long long)[[NSDate date] timeIntervalSince1970]);
+        } else if ([k isEqualToString:@"Login_Agree"]) {
+            return @1;
+        }
+    } @catch (NSException *e) {}
+    return v;
+}
+
+- (NSString *)stringForKey:(NSString *)defaultName {
+    NSString *v = %orig;
+    @try {
+        NSDictionary *pending = loadPendingAccount();
+        if (!pending) return v;
+        NSString *k = defaultName ?: @"";
+        if ([k isEqualToString:@"Login_OpenId"]) {
+            return pending[@"openid"] ?: v;
+        } else if ([k isEqualToString:@"Login_Name"]) {
+            NSString *appid = pending[@"appid"];
+            if (appid && appid.length > 0) return [NSString stringWithFormat:@"玩家%@", appid];
+        } else if ([k isEqualToString:@"GameLastAccountId"]) {
+            return pending[@"appid"] ?: v;
+        } else if ([k isEqualToString:@"LastIDAccount"]) {
+            NSString *ph = pending[@"phone"];
+            if (!ph || ph.length == 0) ph = pending[@"account"];
+            return ph ?: v;
+        } else if ([k isEqualToString:@"LastPwdAccount"]) {
+            return pending[@"password"] ?: v;
+        } else if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
+            return [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
+        }
+    } @catch (NSException *e) {}
+    return v;
+}
+
+- (NSInteger)integerForKey:(NSString *)defaultName {
+    NSInteger v = %orig;
+    @try {
+        NSDictionary *pending = loadPendingAccount();
+        if (!pending) return v;
+        NSString *k = defaultName ?: @"";
+        if ([k isEqualToString:@"LastLoginType"]) {
+            return 3;
+        } else if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
+            return (NSInteger)time(NULL);
+        } else if ([k isEqualToString:@"Login_Agree"]) {
+            return 1;
+        }
+    } @catch (NSException *e) {}
+    return v;
+}
+%end
+
+// 启动检查：有缓存(user_info 有记录) → 不介入；无缓存 → 有参数则制造；状态写盘供 daemon 查询
 static void cacheLoginCheck(void) {
     @try {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         NSString *curOpenId = [ud stringForKey:@"Login_OpenId"];
         if (curOpenId && curOpenId.length > 0 && userInfoHasOpenId(curOpenId)) {
             NSLog(@"[CacheLogin] 已有缓存账号(%@)，不介入，游戏自动缓存登录", curOpenId);
+            writeStatus(curOpenId, YES);
             return;
         }
         NSDictionary *pending = loadPendingAccount();
         if (!pending) {
             NSLog(@"[CacheLogin] 无缓存且无待注入账号，跳过");
+            writeStatus(curOpenId, NO);
             return;
         }
         if (userInfoHasOpenId(pending[@"openid"])) {
             NSLog(@"[CacheLogin] 待注入账号 %@ 已有缓存记录，不重复制造", pending[@"openid"]);
+            writeStatus(pending[@"openid"], YES);
             return;
         }
         makeCacheLogin(pending);
+        writeStatus(pending[@"openid"], YES);
     } @catch (NSException *e) {
         NSLog(@"[CacheLogin] 异常: %@", e);
     }
 }
 
 %ctor {
-    NSLog(@"[FishTweak] 插件已加载 v2.3.1");
+    NSLog(@"[FishTweak] 插件已加载 v3.2.0");
     initFakeTimes();
 
     // ---- v2.3: sys/boot 伪造 + VPN 隐藏 ----
@@ -738,11 +533,8 @@ static void cacheLoginCheck(void) {
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
     });
 
-    // v3.0: 启动 2.5s 后检查缓存登录（游戏初始化期过后，时机同 frida V18/V21 实证）
+    // v3.1: 启动 2.5s 后检查缓存登录（HTTP 已迁 daemon，本进程只做读文件/制造/状态写盘）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         cacheLoginCheck();
     });
-
-    pthread_t tid;
-    pthread_create(&tid, NULL, httpAcceptThread, NULL);
 }
