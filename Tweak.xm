@@ -402,13 +402,23 @@ static void makeCacheLogin(NSDictionary *acct) {
 //    Login_OpenId / Login_Name("玩家"+appid) / GameLastAccountId / LastIDAccount / LastPwdAccount → 目标值
 //  无参数文件时全部走原实现（零干扰）
 // ========================================
+// ========================================
+// 判断是否是缓存登录相关键（非相关键零开销直通，避免每次读参数文件）
+static BOOL isLoginRelatedKey(NSString *k) {
+    if (!k || k.length == 0) return NO;
+    return [k isEqualToString:@"Login_OpenId"] || [k isEqualToString:@"Login_Name"] ||
+           [k isEqualToString:@"GameLastAccountId"] || [k isEqualToString:@"LastIDAccount"] ||
+           [k isEqualToString:@"LastPwdAccount"] || [k isEqualToString:@"ZSFirstStartupLaunchTime"] ||
+           [k isEqualToString:@"Login_Agree"] || [k isEqualToString:@"LastLoginType"];
+}
 %hook NSUserDefaults
 - (id)objectForKey:(NSString *)defaultName {
     id v = %orig;
+    NSString *k = defaultName ?: @"";
+    if (!isLoginRelatedKey(k)) return v;
     @try {
         NSDictionary *pending = loadPendingAccount();
         if (!pending) return v;
-        NSString *k = defaultName ?: @"";
         if ([k isEqualToString:@"Login_OpenId"]) {
             return pending[@"openid"] ?: v;
         } else if ([k isEqualToString:@"Login_Name"]) {
@@ -433,10 +443,11 @@ static void makeCacheLogin(NSDictionary *acct) {
 
 - (NSString *)stringForKey:(NSString *)defaultName {
     NSString *v = %orig;
+    NSString *k = defaultName ?: @"";
+    if (!isLoginRelatedKey(k)) return v;
     @try {
         NSDictionary *pending = loadPendingAccount();
         if (!pending) return v;
-        NSString *k = defaultName ?: @"";
         if ([k isEqualToString:@"Login_OpenId"]) {
             return pending[@"openid"] ?: v;
         } else if ([k isEqualToString:@"Login_Name"]) {
@@ -459,10 +470,11 @@ static void makeCacheLogin(NSDictionary *acct) {
 
 - (NSInteger)integerForKey:(NSString *)defaultName {
     NSInteger v = %orig;
+    NSString *k = defaultName ?: @"";
+    if (!isLoginRelatedKey(k)) return v;
     @try {
         NSDictionary *pending = loadPendingAccount();
         if (!pending) return v;
-        NSString *k = defaultName ?: @"";
         if ([k isEqualToString:@"LastLoginType"]) {
             return 3;
         } else if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
