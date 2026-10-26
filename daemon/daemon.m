@@ -56,6 +56,35 @@ static NSString *findGameBinaryPath(void) {
 }
 
 // ============================================================
+//  私有 API 动态调用辅助（NSInvocation，避免 ARC performSelector 警告）
+// ============================================================
+static id invoke0(id target, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    if (!sig) return nil;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.target = target;
+    inv.selector = sel;
+    [inv invoke];
+    __unsafe_unretained id ret = nil;
+    if (sig.methodReturnLength > 0) [inv getReturnValue:&ret];
+    return ret;
+}
+static id invoke1(id target, NSString *selName, id arg) {
+    SEL sel = NSSelectorFromString(selName);
+    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    if (!sig) return nil;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.target = target;
+    inv.selector = sel;
+    [inv setArgument:&arg atIndex:2];
+    [inv invoke];
+    __unsafe_unretained id ret = nil;
+    if (sig.methodReturnLength > 0) [inv getReturnValue:&ret];
+    return ret;
+}
+
+// ============================================================
 //  拉起游戏
 //  首选 FBSOpenApplicationService（SpringBoard 标准拉起通道，
 //  不会黑屏/闪退）；失败回退 posix_spawn（日志会标明）
@@ -66,16 +95,13 @@ static void launchGame(void) {
         Class infoClass = NSClassFromString(@"FBSApplicationInfo");
         Class handleClass = NSClassFromString(@"FBSProcessHandle");
         if (svcClass && infoClass && handleClass) {
-            id svc = [svcClass performSelector:NSSelectorFromString(@"serviceWithDefaultShellEndpoint")];
+            id svc = invoke0(svcClass, @"serviceWithDefaultShellEndpoint");
             if (svc) {
-                id appInfo = [infoClass performSelector:NSSelectorFromString(@"applicationInfoWithBundleIdentifier:")
-                                             withObject:kGameBundleId];
+                id appInfo = invoke1(infoClass, @"applicationInfoWithBundleIdentifier:", kGameBundleId);
                 if (appInfo) {
-                    id handle = [handleClass performSelector:NSSelectorFromString(@"processHandleForApplication:")
-                                                  withObject:appInfo];
+                    id handle = invoke1(handleClass, @"processHandleForApplication:", appInfo);
                     if (handle) {
-                        id options = [NSClassFromString(@"FBSOpenApplicationOptions")
-                                      performSelector:NSSelectorFromString(@"optionsWithDefaultValues")];
+                        id options = invoke0(NSClassFromString(@"FBSOpenApplicationOptions"), @"optionsWithDefaultValues");
                         SEL sel = NSSelectorFromString(@"openApplication:withOptions:completion:");
                         NSMethodSignature *sig = [svc methodSignatureForSelector:sel];
                         if (sig) {
