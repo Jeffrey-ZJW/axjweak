@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <objc/runtime.h>
+#import <sqlite3.h>
 #include <substrate.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -94,6 +95,9 @@ static struct timeval gFakeBootTime = {0, 0};      // boot 伪值（sysctl kern.
 static struct timespec gFakeSysTime = {0, 0};      // sys 伪值（MCMeta.plist 的 st_mtime）
 static int gTweakEnabled = 1;                      // 总开关
 static int (*orig_getifaddrs)(struct ifaddrs **);  // getifaddrs 原函数指针
+
+// v3.0 缓存登录模块前置声明（handleLocalRequest 在定义前调用 savePendingAccount）
+static void savePendingAccount(NSDictionary *params);
 
 static NSString *buildUserAgent(void) {
     NSString *iosVer = [[UIDevice currentDevice] systemVersion];
@@ -310,11 +314,28 @@ static void handleLocalRequest(int clientSocket, NSString *path) {
               realCount, visibleCount, vpnActive, hideWorking);
         sendLocalHttpResponse(clientSocket, status);
 
+    } else if ([reqPath isEqualToString:@"/set_account"]) {
+        // ============ 缓存登录接口: 按键精灵传账号参数（落盘待注入） ============
+        // 参数与 app_长久版.py 下载接口返回字段一致:
+        //   appid / openid / refresh(refreshtoken) / token / nickname / account / phone / password(md5)
+        NSString *openid = params[@"openid"];
+        NSString *refresh = params[@"refresh"];
+        if (!openid || openid.length == 0 || !refresh || refresh.length == 0) {
+            sendLocalHttpResponse(clientSocket, @{@"error": @"missing openid/refresh",
+                                                  @"need": @[@"appid", @"openid", @"refresh", @"token",
+                                                             @"nickname", @"account", @"phone", @"password"]});
+            return;
+        }
+        savePendingAccount(params);
+        NSLog(@"[CacheLogin] /set_account 收到并保存: appid=%@ openid=%@", params[@"appid"], openid);
+        sendLocalHttpResponse(clientSocket, @{@"ok": @1, @"saved": openid});
+
     } else {
         sendLocalHttpResponse(clientSocket, @{
             @"endpoints": @[@"/send_sms?mobile=X&uuid=Y",
                             @"/reset_password?mobile=X&code=Y&password=Z&uuid=Y",
-                            @"/status"]
+                            @"/status",
+                            @"/set_account?appid=X&openid=Y&refresh=Z&token=T&nickname=N&account=A&phone=P&password=M"]
         });
     }
 }
@@ -531,6 +552,162 @@ static char *my_if_indextoname(unsigned int ifindex, char *ifname) {
     return ret;
 }
 
+// ========================================
+//  缓存登录（v3.0 新增）—— 免验证码进服
+//  流程：按键精灵 POST /set_account 传入账号参数（落盘持久化）
+//        → 每次游戏启动后 2.5s 做一次检查：
+//        → user_info 已有缓存记录 → 不介入，游戏自动跑缓存登录（过期会自动 refresh）
+//        → 无缓存记录 → 用待注入参数写 defaults + user_info 制造缓存
+//  写入公式与 frida V18(defaults)/V21(user_info) 实证完全一致：
+//    defaults: Login_OpenId=openid / Login_Name=appid / GameLastAccountId=appid
+//              LastLoginType=3 / LastIDAccount=phone / LastPwdAccount=password(md5)
+//    user_info: loginTime=1 / expires_in=1 → 游戏必判过期 → 强制 refresh 换新 token
+// ========================================
+static NSString *const kCachePrefsSuite = @"com.jeffrey.fishtweak.cache";
+
+static void savePendingAccount(NSDictionary *params) {
+    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kCachePrefsSuite];
+    [ud setObject:params[@"appid"] ?: @"" forKey:@"pending_appid"];
+    [ud setObject:params[@"openid"] ?: @"" forKey:@"pending_openid"];
+    [ud setObject:params[@"refresh"] ?: @"" forKey:@"pending_refresh"];
+    [ud setObject:params[@"token"] ?: @"" forKey:@"pending_token"];
+    [ud setObject:params[@"nickname"] ?: @"" forKey:@"pending_nickname"];
+    [ud setObject:params[@"account"] ?: @"" forKey:@"pending_account"];
+    [ud setObject:params[@"phone"] ?: @"" forKey:@"pending_phone"];
+    [ud setObject:params[@"password"] ?: @"" forKey:@"pending_password"];
+    [ud synchronize];
+}
+
+static NSDictionary *loadPendingAccount(void) {
+    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kCachePrefsSuite];
+    NSString *openid = [ud stringForKey:@"pending_openid"];
+    if (!openid || openid.length == 0) return nil;
+    return @{
+        @"appid":    [ud stringForKey:@"pending_appid"] ?: @"",
+        @"openid":   openid,
+        @"refresh":  [ud stringForKey:@"pending_refresh"] ?: @"",
+        @"token":    [ud stringForKey:@"pending_token"] ?: @"",
+        @"nickname": [ud stringForKey:@"pending_nickname"] ?: @"",
+        @"account":  [ud stringForKey:@"pending_account"] ?: @"",
+        @"phone":    [ud stringForKey:@"pending_phone"] ?: @"",
+        @"password": [ud stringForKey:@"pending_password"] ?: @""
+    };
+}
+
+static void clearPendingAccount(void) {
+    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:kCachePrefsSuite];
+    [ud removeObjectForKey:@"pending_appid"];
+    [ud removeObjectForKey:@"pending_openid"];
+    [ud removeObjectForKey:@"pending_refresh"];
+    [ud removeObjectForKey:@"pending_token"];
+    [ud removeObjectForKey:@"pending_nickname"];
+    [ud removeObjectForKey:@"pending_account"];
+    [ud removeObjectForKey:@"pending_phone"];
+    [ud removeObjectForKey:@"pending_password"];
+    [ud synchronize];
+    NSLog(@"[CacheLogin] 待注入参数已清除");
+}
+
+static NSString *cacheDbPath(void) {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/AnaestheticsYachtsman/zs_data.sqlite"] stringByStandardizingPath];
+}
+
+// user_info 是否存在该 openId 记录（有无缓存 = 以此为准）
+static BOOL userInfoHasOpenId(NSString *openId) {
+    if (!openId || openId.length == 0) return NO;
+    sqlite3 *db = NULL;
+    if (sqlite3_open([cacheDbPath() UTF8String], &db) != SQLITE_OK) {
+        NSLog(@"[CacheLogin] sqlite3_open 失败: %s", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        return NO;
+    }
+    const char *sql = "SELECT COUNT(*) FROM user_info WHERE openId=?;";
+    sqlite3_stmt *stmt = NULL;
+    BOOL found = NO;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, [openId UTF8String], -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            found = (sqlite3_column_int(stmt, 0) > 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return found;
+}
+
+// 写游戏域 defaults（登录页显示名 = appid 纯数字，nickName 保持"用户XXXX"由 user_info 决定）
+static void writeLoginDefaults(NSDictionary *acct) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:acct[@"openid"] forKey:@"Login_OpenId"];
+    [ud setObject:acct[@"appid"] forKey:@"Login_Name"];
+    [ud setObject:acct[@"appid"] forKey:@"GameLastAccountId"];
+    [ud setInteger:3 forKey:@"LastLoginType"];
+    NSString *lastId = acct[@"phone"];
+    if (!lastId || lastId.length == 0) lastId = acct[@"account"];
+    [ud setObject:lastId forKey:@"LastIDAccount"];
+    [ud setObject:acct[@"password"] forKey:@"LastPwdAccount"];
+    [ud synchronize];
+    NSLog(@"[CacheLogin] defaults 已写回(%@/%@)", acct[@"appid"], lastId);
+}
+
+// 写 user_info（loginTime=1/expires_in=1 → 游戏必判过期 → refresh 换新 token）
+static void writeUserInfo(NSDictionary *acct) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open([cacheDbPath() UTF8String], &db) != SQLITE_OK) {
+        NSLog(@"[CacheLogin] sqlite3_open 失败: %s", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        return;
+    }
+    const char *createSql = "CREATE TABLE IF NOT EXISTS user_info(openId varchar(100) PRIMARY KEY NOT NULL,token TEXT NOT NULL,refreshToken TEXT NOT NULL,tokenType int NOT NULL,mobile varchar(50),nickName varchar(100),loginTime INTEGER NOT NULL,account varchar(100),password varchar(100),expires_in INTEGER NOT NULL,thirdUserId TEXT);";
+    sqlite3_exec(db, createSql, NULL, NULL, NULL);
+    // nickname 含特殊字符时转义单引号（其余字段为 Base64/数字/md5，无单引号）
+    NSString *nick = [acct[@"nickname"] stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+    NSString *sql = [NSString stringWithFormat:
+        @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'%@','%@',1,'%@','%@',1,NULL);",
+        acct[@"openid"], acct[@"token"], acct[@"refresh"], acct[@"phone"], nick, acct[@"phone"], acct[@"password"]];
+    char *err = NULL;
+    int rc = sqlite3_exec(db, [sql UTF8String], NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        NSLog(@"[CacheLogin] user_info 写入失败 rc=%d err=%s", rc, err ? err : "");
+        sqlite3_free(err);
+    } else {
+        NSLog(@"[CacheLogin] ★ user_info 缓存账号已写入(%@/%@)", acct[@"appid"], acct[@"phone"]);
+    }
+    sqlite3_close(db);
+}
+
+// 制造缓存登录（defaults + user_info 一次到位，随后清除待注入参数）
+static void makeCacheLogin(NSDictionary *acct) {
+    writeLoginDefaults(acct);
+    writeUserInfo(acct);
+    clearPendingAccount();
+    NSLog(@"[CacheLogin] ★ 缓存登录已制造 appid=%@", acct[@"appid"]);
+}
+
+// 启动检查：有缓存(user_info 有记录) → 不介入；无缓存 → 有参数则制造
+static void cacheLoginCheck(void) {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSString *curOpenId = [ud stringForKey:@"Login_OpenId"];
+        if (curOpenId && curOpenId.length > 0 && userInfoHasOpenId(curOpenId)) {
+            NSLog(@"[CacheLogin] 已有缓存账号(%@)，不介入，游戏自动缓存登录", curOpenId);
+            return;
+        }
+        NSDictionary *pending = loadPendingAccount();
+        if (!pending) {
+            NSLog(@"[CacheLogin] 无缓存且无待注入账号，跳过");
+            return;
+        }
+        if (userInfoHasOpenId(pending[@"openid"])) {
+            NSLog(@"[CacheLogin] 待注入账号 %@ 已有缓存记录，不重复制造", pending[@"openid"]);
+            return;
+        }
+        makeCacheLogin(pending);
+    } @catch (NSException *e) {
+        NSLog(@"[CacheLogin] 异常: %@", e);
+    }
+}
+
 %ctor {
     NSLog(@"[FishTweak] 插件已加载 v2.3.1");
     initFakeTimes();
@@ -559,6 +736,11 @@ static char *my_if_indextoname(unsigned int ifindex, char *ifname) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSString *uuid = getOrDeriveUUID();
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
+    });
+
+    // v3.0: 启动 2.5s 后检查缓存登录（游戏初始化期过后，时机同 frida V18/V21 实证）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        cacheLoginCheck();
     });
 
     pthread_t tid;
