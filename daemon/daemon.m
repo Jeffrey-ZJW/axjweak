@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
+#include <mach/mach.h>
 #include <dispatch/dispatch.h>
 
 // ---- 固定路径（tweak 与 daemon 共用约定）----
@@ -183,6 +184,77 @@ static void launchGame(void) {
         fishlog(@"[launchGame] FBS 拉起成功，返回");
         return;
     }
+
+    // ---- 通道2：LSApplicationWorkspace（iOS 4+ 通用，LaunchServices 正式拉起通道）----
+    @try {
+        Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
+        if (wsClass) {
+            id ws = invoke0(wsClass, @"defaultWorkspace");
+            if (!ws) ws = [[wsClass alloc] init];
+            SEL sel = NSSelectorFromString(@"openApplicationWithBundleID:");
+            NSMethodSignature *sig = [ws methodSignatureForSelector:sel];
+            if (sig) {
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                inv.target = ws;
+                inv.selector = sel;
+                [inv setArgument:&kGameBundleId atIndex:2];
+                [inv invoke];
+                BOOL ok = NO;
+                if (sig.methodReturnLength == sizeof(BOOL)) {
+                    [inv getReturnValue:&ok];
+                }
+                fishlog(@"[launchGame] LSApplicationWorkspace openApplicationWithBundleID -> %d", ok);
+                if (ok) started = YES;
+            } else {
+                fishlog(@"[launchGame] LSApplicationWorkspace 无 openApplicationWithBundleID:");
+            }
+        } else {
+            fishlog(@"[launchGame] LSApplicationWorkspace 类不可用");
+        }
+    } @catch (NSException *e) {
+        fishlog(@"[launchGame] LSApplicationWorkspace 异常: %@", e);
+    }
+    if (started) {
+        fishlog(@"[launchGame] LSApplicationWorkspace 拉起成功，返回");
+        return;
+    }
+
+    // ---- 通道3：FBSSystemService（iOS 8-10 专用）----
+    @try {
+        Class fbss = NSClassFromString(@"FBSSystemService");
+        if (fbss) {
+            id sysSvc = [[fbss alloc] init];
+            if (!sysSvc) sysSvc = invoke0(fbss, @"sharedService");
+            SEL sel = NSSelectorFromString(@"openApplication:options:clientPort:withResult:");
+            NSMethodSignature *sig = [sysSvc methodSignatureForSelector:sel];
+            if (sig) {
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                inv.target = sysSvc;
+                inv.selector = sel;
+                [inv setArgument:&kGameBundleId atIndex:2];
+                NSDictionary *options = @{};
+                [inv setArgument:&options atIndex:3];
+                uint32_t port = MACH_PORT_NULL;
+                [inv setArgument:&port atIndex:4];
+                id resultBlock = nil;
+                [inv setArgument:&resultBlock atIndex:5];
+                [inv invoke];
+                fishlog(@"[launchGame] FBSSystemService openApplication 已调用（假定成功）");
+                started = YES;
+            } else {
+                fishlog(@"[launchGame] FBSSystemService 无 openApplication:options:clientPort:withResult:");
+            }
+        } else {
+            fishlog(@"[launchGame] FBSSystemService 类不可用");
+        }
+    } @catch (NSException *e) {
+        fishlog(@"[launchGame] FBSSystemService 异常: %@", e);
+    }
+    if (started) {
+        fishlog(@"[launchGame] FBSSystemService 通道执行完毕，返回");
+        return;
+    }
+
     // ---- 兜底：posix_spawn（完整容器环境）----
     if (!exe) { fishlog(@"[launchGame] 未找到游戏二进制，放弃"); return; }
     NSString *container = findDataContainer(kGameBundleId);
