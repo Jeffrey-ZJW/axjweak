@@ -9,6 +9,8 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <ifaddrs.h>
