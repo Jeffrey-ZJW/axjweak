@@ -342,6 +342,26 @@ static BOOL userInfoHasOpenId(NSString *openId) {
     return found;
 }
 
+// user_info 表是否已有任意缓存账号（防止"二次启动/无 pending"时仍被首启判定拦截）
+static BOOL hasAnyCachedAccount(void) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open([cacheDbPath() UTF8String], &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return NO;
+    }
+    const char *sql = "SELECT COUNT(*) FROM user_info;";
+    sqlite3_stmt *stmt = NULL;
+    BOOL found = NO;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            found = (sqlite3_column_int(stmt, 0) > 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return found;
+}
+
 // 写游戏域 defaults（登录页显示名 = "玩家"+appid，nickName 保持"用户XXXX"由 user_info 决定）
 // v3.2: 补齐 ZSFirstStartupLaunchTime(当前时间戳) + Login_Agree(1) —— 未初始化环境直接骗过"首启判定"
 static void writeLoginDefaults(NSDictionary *acct) {
@@ -411,79 +431,101 @@ static BOOL isLoginRelatedKey(NSString *k) {
            [k isEqualToString:@"LastPwdAccount"] || [k isEqualToString:@"ZSFirstStartupLaunchTime"] ||
            [k isEqualToString:@"Login_Agree"] || [k isEqualToString:@"LastLoginType"];
 }
+
+// v3.2.1 统一拦截：返回非 nil 表示本次读取应被替换（nil = 走 %orig 原实现）
+//  - ZSFirstStartupLaunchTime：pending 在 或 user_info 已有缓存 → 返回当前时间戳（骗过"首次启动"判定）
+//  - Login_OpenId：pending 在 → 立即制造缓存（不再等 2.5s），返回 openid；后续键直接读已写入的真实值
+//  - Login_Name / GameLastAccountId / LastIDAccount / LastPwdAccount / Login_Agree / LastLoginType → 目标值
+static id overrideLoginValueForKey(NSString *k) {
+    if (!isLoginRelatedKey(k)) return nil;
+    @try {
+        NSDictionary *pending = loadPendingAccount();
+        if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
+            if (pending || hasAnyCachedAccount()) {
+                return @((long long)[[NSDate date] timeIntervalSince1970]);
+            }
+            return nil;
+        }
+        if (!pending) return nil;
+        if ([k isEqualToString:@"Login_OpenId"]) {
+            makeCacheLogin(pending);   // 首读到账号键 → 立即写 defaults+user_info 并清参数文件
+            return pending[@"openid"] ?: @"";
+        } else if ([k isEqualToString:@"Login_Name"]) {
+            NSString *appid = pending[@"appid"];
+            if (appid && appid.length > 0) return [NSString stringWithFormat:@"玩家%@", appid];
+        } else if ([k isEqualToString:@"GameLastAccountId"]) {
+            return pending[@"appid"] ?: nil;
+        } else if ([k isEqualToString:@"LastIDAccount"]) {
+            NSString *ph = pending[@"phone"];
+            if (!ph || ph.length == 0) ph = pending[@"account"];
+            return ph ?: nil;
+        } else if ([k isEqualToString:@"LastPwdAccount"]) {
+            return pending[@"password"] ?: nil;
+        } else if ([k isEqualToString:@"Login_Agree"]) {
+            return @1;
+        } else if ([k isEqualToString:@"LastLoginType"]) {
+            return @3;
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 %hook NSUserDefaults
 - (id)objectForKey:(NSString *)defaultName {
     id v = %orig;
-    NSString *k = defaultName ?: @"";
-    if (!isLoginRelatedKey(k)) return v;
-    @try {
-        NSDictionary *pending = loadPendingAccount();
-        if (!pending) return v;
-        if ([k isEqualToString:@"Login_OpenId"]) {
-            return pending[@"openid"] ?: v;
-        } else if ([k isEqualToString:@"Login_Name"]) {
-            NSString *appid = pending[@"appid"];
-            if (appid && appid.length > 0) return [NSString stringWithFormat:@"玩家%@", appid];
-        } else if ([k isEqualToString:@"GameLastAccountId"]) {
-            return pending[@"appid"] ?: v;
-        } else if ([k isEqualToString:@"LastIDAccount"]) {
-            NSString *ph = pending[@"phone"];
-            if (!ph || ph.length == 0) ph = pending[@"account"];
-            return ph ?: v;
-        } else if ([k isEqualToString:@"LastPwdAccount"]) {
-            return pending[@"password"] ?: v;
-        } else if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
-            return @((long long)[[NSDate date] timeIntervalSince1970]);
-        } else if ([k isEqualToString:@"Login_Agree"]) {
-            return @1;
-        }
-    } @catch (NSException *e) {}
-    return v;
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    return ov ? ov : v;
 }
-
 - (NSString *)stringForKey:(NSString *)defaultName {
     NSString *v = %orig;
-    NSString *k = defaultName ?: @"";
-    if (!isLoginRelatedKey(k)) return v;
-    @try {
-        NSDictionary *pending = loadPendingAccount();
-        if (!pending) return v;
-        if ([k isEqualToString:@"Login_OpenId"]) {
-            return pending[@"openid"] ?: v;
-        } else if ([k isEqualToString:@"Login_Name"]) {
-            NSString *appid = pending[@"appid"];
-            if (appid && appid.length > 0) return [NSString stringWithFormat:@"玩家%@", appid];
-        } else if ([k isEqualToString:@"GameLastAccountId"]) {
-            return pending[@"appid"] ?: v;
-        } else if ([k isEqualToString:@"LastIDAccount"]) {
-            NSString *ph = pending[@"phone"];
-            if (!ph || ph.length == 0) ph = pending[@"account"];
-            return ph ?: v;
-        } else if ([k isEqualToString:@"LastPwdAccount"]) {
-            return pending[@"password"] ?: v;
-        } else if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
-            return [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
-        }
-    } @catch (NSException *e) {}
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    if (!ov) return v;
+    if ([ov isKindOfClass:[NSString class]]) return ov;
+    if ([ov isKindOfClass:[NSNumber class]]) return [ov stringValue];
     return v;
 }
-
 - (NSInteger)integerForKey:(NSString *)defaultName {
     NSInteger v = %orig;
-    NSString *k = defaultName ?: @"";
-    if (!isLoginRelatedKey(k)) return v;
-    @try {
-        NSDictionary *pending = loadPendingAccount();
-        if (!pending) return v;
-        if ([k isEqualToString:@"LastLoginType"]) {
-            return 3;
-        } else if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
-            return (NSInteger)time(NULL);
-        } else if ([k isEqualToString:@"Login_Agree"]) {
-            return 1;
-        }
-    } @catch (NSException *e) {}
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    if (!ov) return v;
+    if ([ov isKindOfClass:[NSNumber class]]) return [ov integerValue];
+    if ([ov isKindOfClass:[NSString class]]) return [ov integerValue];
     return v;
+}
+- (BOOL)boolForKey:(NSString *)defaultName {
+    BOOL v = %orig;
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    if (!ov) return v;
+    if ([ov isKindOfClass:[NSNumber class]]) return [ov boolValue];
+    return v;
+}
+- (double)doubleForKey:(NSString *)defaultName {
+    double v = %orig;
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    if (!ov) return v;
+    if ([ov isKindOfClass:[NSNumber class]]) return [ov doubleValue];
+    if ([ov isKindOfClass:[NSString class]]) return [ov doubleValue];
+    return v;
+}
+- (NSArray *)arrayForKey:(NSString *)defaultName {
+    NSArray *v = %orig;
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    return ov ? ov : v;
+}
+- (NSDictionary *)dictionaryForKey:(NSString *)defaultName {
+    NSDictionary *v = %orig;
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    return ov ? ov : v;
+}
+- (NSData *)dataForKey:(NSString *)defaultName {
+    NSData *v = %orig;
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    return ov ? ov : v;
+}
+- (NSURL *)URLForKey:(NSString *)defaultName {
+    NSURL *v = %orig;
+    id ov = overrideLoginValueForKey(defaultName ?: @"");
+    return ov ? ov : v;
 }
 %end
 
@@ -545,8 +587,8 @@ static void cacheLoginCheck(void) {
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
     });
 
-    // v3.1: 启动 2.5s 后检查缓存登录（HTTP 已迁 daemon，本进程只做读文件/制造/状态写盘）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // v3.1: 启动 1.2s 后兜底检查缓存登录（HTTP 已迁 daemon，本进程只做读文件/制造/状态写盘）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         cacheLoginCheck();
     });
 }
