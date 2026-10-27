@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdio.h>
+#include <errno.h>
 #include <dispatch/dispatch.h>
 
 // ---- 固定路径（tweak 与 daemon 共用约定）----
