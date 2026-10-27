@@ -197,7 +197,8 @@ static void launchGame(void) {
                 NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
                 inv.target = ws;
                 inv.selector = sel;
-                [inv setArgument:&kGameBundleId atIndex:2];
+                NSString *bid = kGameBundleId;
+                [inv setArgument:&bid atIndex:2];
                 [inv invoke];
                 BOOL ok = NO;
                 if (sig.methodReturnLength == sizeof(BOOL)) {
@@ -231,7 +232,8 @@ static void launchGame(void) {
                 NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
                 inv.target = sysSvc;
                 inv.selector = sel;
-                [inv setArgument:&kGameBundleId atIndex:2];
+                NSString *bid = kGameBundleId;
+                [inv setArgument:&bid atIndex:2];
                 NSDictionary *options = @{};
                 [inv setArgument:&options atIndex:3];
                 uint32_t port = MACH_PORT_NULL;
