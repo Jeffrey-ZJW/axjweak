@@ -263,16 +263,22 @@ static void launchGame(void) {
     fishlog(@"[launchGame] data 容器: %@", container ?: @"未找到");
     pid_t pid = 0;
     char *argv[] = {(char *)[exe UTF8String], NULL};
-    char envTmp[1024], envBundle[1024];
-    char *envp[8];
+    char envTmp[1024], envBundle[1024], envHome[1024], envFixed[1024];
+    char *envp[10];
     int ei = 0;
-    envp[ei++] = (char *)"HOME=/var/mobile";
-    envp[ei++] = (char *)"CFFIXED_USER_HOME=/var/mobile";
     if (container) {
+        // iOS app 的 HOME 必须是 data 容器（NSHomeDirectory() 依赖它定位 Documents 缓存库）
+        snprintf(envHome, sizeof(envHome), "HOME=%s", [container UTF8String]);
+        snprintf(envFixed, sizeof(envFixed), "CFFIXED_USER_HOME=%s", [container UTF8String]);
         snprintf(envTmp, sizeof(envTmp), "TMPDIR=%s/tmp", [container UTF8String]);
         snprintf(envBundle, sizeof(envBundle), "BUNDLE_CONTAINER=%s", [container UTF8String]);
+        envp[ei++] = envHome;
+        envp[ei++] = envFixed;
         envp[ei++] = envTmp;
         envp[ei++] = envBundle;
+    } else {
+        envp[ei++] = (char *)"HOME=/var/mobile";
+        envp[ei++] = (char *)"CFFIXED_USER_HOME=/var/mobile";
     }
     envp[ei++] = (char *)"XPC_SERVICE_NAME=0";
     envp[ei] = NULL;

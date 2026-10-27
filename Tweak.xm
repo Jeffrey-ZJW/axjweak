@@ -458,7 +458,15 @@ static void tlog(NSString *fmt, ...) {
 //  - Login_OpenId / Login_Name / GameLastAccountId / LastIDAccount / LastPwdAccount / Login_Agree / LastLoginType → 目标值
 //  - 注意：hook 内只读不写（写盘仅由异步 cacheLoginCheck 做，避免 NSUserDefaults 读内嵌写死锁）
 static id overrideLoginValueForKey(NSString *k) {
-    if (!isLoginRelatedKey(k)) return nil;
+    if (!isLoginRelatedKey(k)) {
+        // 只记录前 15 个非登录键，确认游戏确实在走 NSUserDefaults 读流程
+        static int sDiagCount = 0;
+        if (sDiagCount < 15) {
+            sDiagCount++;
+            tlog(@"READ %@ (非登录键, 第%d个)", k, sDiagCount);
+        }
+        return nil;
+    }
     @try {
         NSDictionary *pending = loadPendingAccount();
         if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
