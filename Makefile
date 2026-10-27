@@ -17,7 +17,7 @@ SUBPROJECTS += daemon
 before-stage::
 	chmod 755 layout/DEBIAN/postinst layout/DEBIAN/prerm
 	@mkdir -p layout/Library/MobileSubstrate/DynamicLibraries
-	@cp $$(find "$(THEOS_OBJ_DIR)" -name fishtweak.dylib | head -1) layout/Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib 2>/dev/null || echo "WARN: dylib not found"
+	@cp $$(find . -name fishtweak.dylib -not -path "./layout/*" | head -1) layout/Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib 2>/dev/null && echo "== DYLIB COPIED OK ==" || echo "== WARN: dylib not found =="
 	@cp fishtweak.plist layout/Library/MobileSubstrate/DynamicLibraries/fishtweak.plist
 	@ls -l layout/DEBIAN/postinst layout/DEBIAN/prerm layout/Library/MobileSubstrate/DynamicLibraries/
 
