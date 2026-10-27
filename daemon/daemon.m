@@ -31,7 +31,7 @@ static NSString *const kLogFile     = @"/var/mobile/Library/Preferences/com.jeff
 static NSString *const kGameBundleId = @"com.gzlj.fishdecisive";
 
 // ---- 文件日志（老 iOS 无 log 命令，syslog 不可靠；写文件最稳）----
-static void logf(NSString *fmt, ...) {
+static void fishlog(NSString *fmt, ...) {
     va_list args; va_start(args, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
@@ -132,21 +132,21 @@ static NSString *findDataContainer(NSString *bundleId) {
 //  全步骤写文件日志 kLogFile（SSH: cat /var/mobile/Library/Preferences/com.jeffrey.fishtweakd.log）
 // ============================================================
 static void launchGame(void) {
-    logf(@"[launchGame] 开始拉起 %@", kGameBundleId);
+    fishlog(@"[launchGame] 开始拉起 %@", kGameBundleId);
     NSString *exe = findGameBinaryPath();
-    logf(@"[launchGame] findGameBinaryPath -> %@", exe ?: @"nil");
+    fishlog(@"[launchGame] findGameBinaryPath -> %@", exe ?: @"nil");
     BOOL started = NO;
     @try {
         Class svcClass = NSClassFromString(@"FBSOpenApplicationService");
         Class infoClass = NSClassFromString(@"FBSApplicationInfo");
         Class handleClass = NSClassFromString(@"FBSProcessHandle");
-        logf(@"[launchGame] FBS 类可用: svc=%d info=%d handle=%d", svcClass != nil, infoClass != nil, handleClass != nil);
+        fishlog(@"[launchGame] FBS 类可用: svc=%d info=%d handle=%d", svcClass != nil, infoClass != nil, handleClass != nil);
         if (svcClass && infoClass && handleClass) {
             id svc = invoke0(svcClass, @"serviceWithDefaultShellEndpoint");
             id appInfo = invoke1(infoClass, @"applicationInfoWithBundleIdentifier:", kGameBundleId);
             id handle = invoke1(handleClass, @"processHandleForApplication:", appInfo);
             id options = invoke0(NSClassFromString(@"FBSOpenApplicationOptions"), @"optionsWithDefaultValues");
-            logf(@"[launchGame] FBS 对象: svc=%d appInfo=%d handle=%d options=%d", svc != nil, appInfo != nil, handle != nil, options != nil);
+            fishlog(@"[launchGame] FBS 对象: svc=%d appInfo=%d handle=%d options=%d", svc != nil, appInfo != nil, handle != nil, options != nil);
             if (svc && appInfo && handle) {
                 SEL sel = NSSelectorFromString(@"openApplication:withOptions:completion:");
                 NSMethodSignature *sig = [svc methodSignatureForSelector:sel];
@@ -160,33 +160,33 @@ static void launchGame(void) {
                     __block NSError *fbsErr = nil;
                     void (^completion)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
                         fbsErr = error;
-                        logf(@"[launchGame] FBS completion: success=%d error=%@", success, error);
+                        fishlog(@"[launchGame] FBS completion: success=%d error=%@", success, error);
                         dispatch_semaphore_signal(sem);
                     };
                     [inv setArgument:&completion atIndex:4];
                     [inv invoke];
-                    logf(@"[launchGame] FBS openApplication 已调用，等待回调(≤3s)...");
+                    fishlog(@"[launchGame] FBS openApplication 已调用，等待回调(≤3s)...");
                     long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-                    logf(@"[launchGame] FBS 等待结束 r=%ld error=%@", r, fbsErr);
+                    fishlog(@"[launchGame] FBS 等待结束 r=%ld error=%@", r, fbsErr);
                     if (r == 0 && !fbsErr) started = YES;
                 } else {
-                    logf(@"[launchGame] FBS 无 openApplication:withOptions:completion: 方法");
+                    fishlog(@"[launchGame] FBS 无 openApplication:withOptions:completion: 方法");
                 }
             }
         } else {
-            logf(@"[launchGame] FBS 类不可用，走 posix_spawn");
+            fishlog(@"[launchGame] FBS 类不可用，走 posix_spawn");
         }
     } @catch (NSException *e) {
-        logf(@"[launchGame] FBS 拉起异常: %@", e);
+        fishlog(@"[launchGame] FBS 拉起异常: %@", e);
     }
     if (started) {
-        logf(@"[launchGame] FBS 拉起成功，返回");
+        fishlog(@"[launchGame] FBS 拉起成功，返回");
         return;
     }
     // ---- 兜底：posix_spawn（完整容器环境）----
-    if (!exe) { logf(@"[launchGame] 未找到游戏二进制，放弃"); return; }
+    if (!exe) { fishlog(@"[launchGame] 未找到游戏二进制，放弃"); return; }
     NSString *container = findDataContainer(kGameBundleId);
-    logf(@"[launchGame] data 容器: %@", container ?: @"未找到");
+    fishlog(@"[launchGame] data 容器: %@", container ?: @"未找到");
     pid_t pid = 0;
     char *argv[] = {(char *)[exe UTF8String], NULL};
     char envTmp[1024], envBundle[1024];
@@ -203,12 +203,12 @@ static void launchGame(void) {
     envp[ei++] = (char *)"XPC_SERVICE_NAME=0";
     envp[ei] = NULL;
     int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, argv, envp);
-    logf(@"[launchGame] posix_spawn rc=%d pid=%d (%s)", rc, (int)pid, rc == 0 ? "OK" : strerror(rc));
+    fishlog(@"[launchGame] posix_spawn rc=%d pid=%d (%s)", rc, (int)pid, rc == 0 ? "OK" : strerror(rc));
     if (rc == 0) {
         usleep(1000 * 1000);   // 等 1s 看进程是否存活（缺环境会立即退出）
         int st = 0;
         pid_t r2 = waitpid(pid, &st, WNOHANG);
-        logf(@"[launchGame] 1s 后 waitpid=%d status=%d (0=进程仍在运行)", (int)r2, st);
+        fishlog(@"[launchGame] 1s 后 waitpid=%d status=%d (0=进程仍在运行)", (int)r2, st);
     }
 }
 
@@ -413,7 +413,7 @@ static void handleRequest(int clientSocket, NSString *request) {
             return;
         }
         saveAccount(params);
-        logf(@"[set_account] 收号 appid=%@ openid=%@ launch=%@", params[@"appid"] ?: @"", params[@"openid"] ?: @"", params[@"launch"] ?: @"1");
+        fishlog(@"[set_account] 收号 appid=%@ openid=%@ launch=%@", params[@"appid"] ?: @"", params[@"openid"] ?: @"", params[@"launch"] ?: @"1");
         BOOL doLaunch = YES;
         id launchVal = params[@"launch"];
         if (launchVal) {
