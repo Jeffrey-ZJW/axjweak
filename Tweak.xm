@@ -432,41 +432,75 @@ static BOOL isLoginRelatedKey(NSString *k) {
            [k isEqualToString:@"Login_Agree"] || [k isEqualToString:@"LastLoginType"];
 }
 
-// v3.2.1 统一拦截：返回非 nil 表示本次读取应被替换（nil = 走 %orig 原实现）
+// ---- tweak 文件日志（老 iOS 无 log 命令，写文件最稳；诊断 hook 是否触发）----
+static NSString *const kTweakLogFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.tweak.log";
+static void tlog(NSString *fmt, ...) {
+    va_list args; va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kTweakLogFile];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:kTweakLogFile contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:kTweakLogFile];
+    }
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    }
+}
+
+// v3.2.3 统一拦截：返回非 nil 表示本次读取应被替换（nil = 走 %orig 原实现）
 //  - ZSFirstStartupLaunchTime：pending 在 或 user_info 已有缓存 → 返回当前时间戳（骗过"首次启动"判定）
-//  - Login_OpenId：pending 在 → 立即制造缓存（不再等 2.5s），返回 openid；后续键直接读已写入的真实值
-//  - Login_Name / GameLastAccountId / LastIDAccount / LastPwdAccount / Login_Agree / LastLoginType → 目标值
+//  - Login_OpenId / Login_Name / GameLastAccountId / LastIDAccount / LastPwdAccount / Login_Agree / LastLoginType → 目标值
+//  - 注意：hook 内只读不写（写盘仅由异步 cacheLoginCheck 做，避免 NSUserDefaults 读内嵌写死锁）
 static id overrideLoginValueForKey(NSString *k) {
     if (!isLoginRelatedKey(k)) return nil;
     @try {
         NSDictionary *pending = loadPendingAccount();
         if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
             if (pending || hasAnyCachedAccount()) {
+                tlog(@"HOOK ZSFirstStartupLaunchTime -> 当前时间戳 (pending=%d hasCache=1)", pending != nil);
                 return @((long long)[[NSDate date] timeIntervalSince1970]);
             }
+            tlog(@"HOOK ZSFirstStartupLaunchTime -> 无 pending 无缓存，走原值");
             return nil;
         }
-        if (!pending) return nil;
+        if (!pending) {
+            tlog(@"HOOK 读到 %@ -> 无 pending，走原值", k);
+            return nil;
+        }
         if ([k isEqualToString:@"Login_OpenId"]) {
-            makeCacheLogin(pending);   // 首读到账号键 → 立即写 defaults+user_info 并清参数文件
+            tlog(@"HOOK Login_OpenId -> %@", pending[@"openid"] ?: @"(空)");
             return pending[@"openid"] ?: @"";
         } else if ([k isEqualToString:@"Login_Name"]) {
             NSString *appid = pending[@"appid"];
-            if (appid && appid.length > 0) return [NSString stringWithFormat:@"玩家%@", appid];
+            if (appid && appid.length > 0) {
+                tlog(@"HOOK Login_Name -> 玩家%@", appid);
+                return [NSString stringWithFormat:@"玩家%@", appid];
+            }
         } else if ([k isEqualToString:@"GameLastAccountId"]) {
+            tlog(@"HOOK GameLastAccountId -> %@", pending[@"appid"] ?: @"(空)");
             return pending[@"appid"] ?: nil;
         } else if ([k isEqualToString:@"LastIDAccount"]) {
             NSString *ph = pending[@"phone"];
             if (!ph || ph.length == 0) ph = pending[@"account"];
+            tlog(@"HOOK LastIDAccount -> %@", ph ?: @"(空)");
             return ph ?: nil;
         } else if ([k isEqualToString:@"LastPwdAccount"]) {
+            tlog(@"HOOK LastPwdAccount -> %@", pending[@"password"] ?: @"(空)");
             return pending[@"password"] ?: nil;
         } else if ([k isEqualToString:@"Login_Agree"]) {
+            tlog(@"HOOK Login_Agree -> 1");
             return @1;
         } else if ([k isEqualToString:@"LastLoginType"]) {
+            tlog(@"HOOK LastLoginType -> 3");
             return @3;
         }
-    } @catch (NSException *e) {}
+    } @catch (NSException *e) {
+        tlog(@"HOOK 异常: %@", e);
+    }
     return nil;
 }
 
@@ -535,30 +569,36 @@ static void cacheLoginCheck(void) {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         NSString *curOpenId = [ud stringForKey:@"Login_OpenId"];
         if (curOpenId && curOpenId.length > 0 && userInfoHasOpenId(curOpenId)) {
+            tlog(@"cacheLoginCheck: 已有缓存账号(%@)，不介入", curOpenId);
             NSLog(@"[CacheLogin] 已有缓存账号(%@)，不介入，游戏自动缓存登录", curOpenId);
             writeStatus(curOpenId, YES);
             return;
         }
         NSDictionary *pending = loadPendingAccount();
         if (!pending) {
+            tlog(@"cacheLoginCheck: 无缓存且无待注入账号，跳过");
             NSLog(@"[CacheLogin] 无缓存且无待注入账号，跳过");
             writeStatus(curOpenId, NO);
             return;
         }
         if (userInfoHasOpenId(pending[@"openid"])) {
+            tlog(@"cacheLoginCheck: 待注入账号 %@ 已有缓存记录，不重复制造", pending[@"openid"]);
             NSLog(@"[CacheLogin] 待注入账号 %@ 已有缓存记录，不重复制造", pending[@"openid"]);
             writeStatus(pending[@"openid"], YES);
             return;
         }
+        tlog(@"cacheLoginCheck: ★ 制造缓存 appid=%@", pending[@"appid"] ?: @"?");
         makeCacheLogin(pending);
         writeStatus(pending[@"openid"], YES);
     } @catch (NSException *e) {
+        tlog(@"cacheLoginCheck 异常: %@", e);
         NSLog(@"[CacheLogin] 异常: %@", e);
     }
 }
 
 %ctor {
-    NSLog(@"[FishTweak] 插件已加载 v3.2.0");
+    NSLog(@"[FishTweak] 插件已加载 v3.2.3");
+    tlog(@"★ 插件已加载 v3.2.3，进程=%@", [[NSProcessInfo processInfo] processName]);
     initFakeTimes();
 
     // ---- v2.3: sys/boot 伪造 + VPN 隐藏 ----
