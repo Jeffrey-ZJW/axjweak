@@ -22,7 +22,27 @@
 // ---- 固定路径（tweak 与 daemon 共用约定）----
 static NSString *const kAccountFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.account.plist";   // daemon 写 / tweak 读
 static NSString *const kStatusFile  = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.status.plist";    // tweak 写 / daemon 读
+static NSString *const kLogFile     = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweakd.log";            // daemon 运行日志
 static NSString *const kGameBundleId = @"com.gzlj.fishdecisive";
+
+// ---- 文件日志（老 iOS 无 log 命令，syslog 不可靠；写文件最稳）----
+static void logf(NSString *fmt, ...) {
+    va_list args; va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogFile];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:kLogFile contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:kLogFile];
+    }
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    }
+    NSLog(@"%@", msg);
+}
 
 // ---- 游戏 API 常量（原插件迁入）----
 static NSString *const kAPIHost = @"https://openapi.buyuios.com";
@@ -85,55 +105,105 @@ static id invoke1(id target, NSString *selName, id arg) {
 }
 
 // ============================================================
+//  定位游戏数据容器（/var/mobile/Containers/Data/Application/<uuid>）
+//  通过 .com.apple.mobile_container_manager.metadata.plist 匹配 bundle id
+// ============================================================
+static NSString *findDataContainer(NSString *bundleId) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *top = [fm contentsOfDirectoryAtPath:@"/var/mobile/Containers/Data/Application" error:NULL];
+    for (NSString *d in top) {
+        NSString *dir = [@"/var/mobile/Containers/Data/Application" stringByAppendingPathComponent:d];
+        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:
+                              [dir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"]];
+        if ([meta[@"MCMMetadataIdentifier"] isEqualToString:bundleId]) return dir;
+    }
+    return nil;
+}
+
+// ============================================================
 //  拉起游戏
-//  首选 FBSOpenApplicationService（SpringBoard 标准拉起通道，
-//  不会黑屏/闪退）；失败回退 posix_spawn（日志会标明）
+//  首选 FBSOpenApplicationService（SpringBoard 标准拉起通道，带错误回调）；
+//  FBS 失败/超时 → 回退 posix_spawn（带完整容器环境变量，避免黑屏/闪退）
+//  全步骤写文件日志 kLogFile（SSH: cat /var/mobile/Library/Preferences/com.jeffrey.fishtweakd.log）
 // ============================================================
 static void launchGame(void) {
+    logf(@"[launchGame] 开始拉起 %@", kGameBundleId);
+    NSString *exe = findGameBinaryPath();
+    logf(@"[launchGame] findGameBinaryPath -> %@", exe ?: @"nil");
+    BOOL started = NO;
     @try {
         Class svcClass = NSClassFromString(@"FBSOpenApplicationService");
         Class infoClass = NSClassFromString(@"FBSApplicationInfo");
         Class handleClass = NSClassFromString(@"FBSProcessHandle");
+        logf(@"[launchGame] FBS 类可用: svc=%d info=%d handle=%d", svcClass != nil, infoClass != nil, handleClass != nil);
         if (svcClass && infoClass && handleClass) {
             id svc = invoke0(svcClass, @"serviceWithDefaultShellEndpoint");
-            if (svc) {
-                id appInfo = invoke1(infoClass, @"applicationInfoWithBundleIdentifier:", kGameBundleId);
-                if (appInfo) {
-                    id handle = invoke1(handleClass, @"processHandleForApplication:", appInfo);
-                    if (handle) {
-                        id options = invoke0(NSClassFromString(@"FBSOpenApplicationOptions"), @"optionsWithDefaultValues");
-                        SEL sel = NSSelectorFromString(@"openApplication:withOptions:completion:");
-                        NSMethodSignature *sig = [svc methodSignatureForSelector:sel];
-                        if (sig) {
-                            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                            inv.target = svc;
-                            inv.selector = sel;
-                            [inv setArgument:&handle atIndex:2];
-                            [inv setArgument:&options atIndex:3];
-                            id nilBlock = nil;
-                            [inv setArgument:&nilBlock atIndex:4];
-                            [inv invoke];
-                            NSLog(@"[FishTweakD] FBS 拉起请求已发送 %@", kGameBundleId);
-                            return;
-                        }
-                    }
+            id appInfo = invoke1(infoClass, @"applicationInfoWithBundleIdentifier:", kGameBundleId);
+            id handle = invoke1(handleClass, @"processHandleForApplication:", appInfo);
+            id options = invoke0(NSClassFromString(@"FBSOpenApplicationOptions"), @"optionsWithDefaultValues");
+            logf(@"[launchGame] FBS 对象: svc=%d appInfo=%d handle=%d options=%d", svc != nil, appInfo != nil, handle != nil, options != nil);
+            if (svc && appInfo && handle) {
+                SEL sel = NSSelectorFromString(@"openApplication:withOptions:completion:");
+                NSMethodSignature *sig = [svc methodSignatureForSelector:sel];
+                if (sig) {
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.target = svc;
+                    inv.selector = sel;
+                    [inv setArgument:&handle atIndex:2];
+                    [inv setArgument:&options atIndex:3];
+                    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                    __block NSError *fbsErr = nil;
+                    void (^completion)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
+                        fbsErr = error;
+                        logf(@"[launchGame] FBS completion: success=%d error=%@", success, error);
+                        dispatch_semaphore_signal(sem);
+                    };
+                    [inv setArgument:&completion atIndex:4];
+                    [inv invoke];
+                    logf(@"[launchGame] FBS openApplication 已调用，等待回调(≤3s)...");
+                    long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+                    logf(@"[launchGame] FBS 等待结束 r=%ld error=%@", r, fbsErr);
+                    if (r == 0 && !fbsErr) started = YES;
+                } else {
+                    logf(@"[launchGame] FBS 无 openApplication:withOptions:completion: 方法");
                 }
             }
+        } else {
+            logf(@"[launchGame] FBS 类不可用，走 posix_spawn");
         }
-        NSLog(@"[FishTweakD] FBS 类不可用，回退 posix_spawn");
     } @catch (NSException *e) {
-        NSLog(@"[FishTweakD] FBS 拉起异常: %@", e);
+        logf(@"[launchGame] FBS 拉起异常: %@", e);
     }
-    // ---- 兜底：posix_spawn（可能黑屏/闪退，仅作最后手段）----
-    NSString *exe = findGameBinaryPath();
-    if (!exe) { NSLog(@"[FishTweakD] 未找到游戏(%@)，无法拉起", kGameBundleId); return; }
+    if (started) {
+        logf(@"[launchGame] FBS 拉起成功，返回");
+        return;
+    }
+    // ---- 兜底：posix_spawn（完整容器环境）----
+    if (!exe) { logf(@"[launchGame] 未找到游戏二进制，放弃"); return; }
+    NSString *container = findDataContainer(kGameBundleId);
+    logf(@"[launchGame] data 容器: %@", container ?: @"未找到");
     pid_t pid = 0;
     char *argv[] = {(char *)[exe UTF8String], NULL};
-    int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, argv, NULL);
+    char envTmp[1024], envBundle[1024];
+    char *envp[8];
+    int ei = 0;
+    envp[ei++] = (char *)"HOME=/var/mobile";
+    envp[ei++] = (char *)"CFFIXED_USER_HOME=/var/mobile";
+    if (container) {
+        snprintf(envTmp, sizeof(envTmp), "TMPDIR=%s/tmp", [container UTF8String]);
+        snprintf(envBundle, sizeof(envBundle), "BUNDLE_CONTAINER=%s", [container UTF8String]);
+        envp[ei++] = envTmp;
+        envp[ei++] = envBundle;
+    }
+    envp[ei++] = (char *)"XPC_SERVICE_NAME=0";
+    envp[ei] = NULL;
+    int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, argv, envp);
+    logf(@"[launchGame] posix_spawn rc=%d pid=%d (%s)", rc, (int)pid, rc == 0 ? "OK" : strerror(rc));
     if (rc == 0) {
-        NSLog(@"[FishTweakD] 已拉起游戏 %@ pid=%d", exe, (int)pid);
-    } else {
-        NSLog(@"[FishTweakD] 拉起失败 rc=%d (%s)", rc, strerror(rc));
+        usleep(1000 * 1000);   // 等 1s 看进程是否存活（缺环境会立即退出）
+        int st = 0;
+        pid_t r2 = waitpid(pid, &st, WNOHANG);
+        logf(@"[launchGame] 1s 后 waitpid=%d status=%d (0=进程仍在运行)", (int)r2, st);
     }
 }
 
@@ -338,6 +408,7 @@ static void handleRequest(int clientSocket, NSString *request) {
             return;
         }
         saveAccount(params);
+        logf(@"[set_account] 收号 appid=%@ openid=%@ launch=%@", params[@"appid"] ?: @"", params[@"openid"] ?: @"", params[@"launch"] ?: @"1");
         BOOL doLaunch = YES;
         id launchVal = params[@"launch"];
         if (launchVal) {
