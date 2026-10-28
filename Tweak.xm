@@ -388,6 +388,28 @@ static void writeLoginDefaults(NSDictionary *acct) {
     NSLog(@"[CacheLogin] defaults 已写回(玩家%@/%@)", acct[@"appid"], lastId);
 }
 
+// v3.3.4: password 明文hex(16位) → AES-128-ECB+PKCS7 加密 → base64密文（与游戏/自然标准一致）
+// key=Ze1QLUFj296TAho2；已为 44 字符 base64 密文则直接返回，不重复加密
+static NSString *aesEncryptPassword(NSString *plain) {
+    if (!plain || plain.length == 0) return nil;
+    if (plain.length == 44 && [plain hasSuffix:@"="]) return plain; // 已是密文
+    NSData *keyData = [@"Ze1QLUFj296TAho2" dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *plainData = [plain dataUsingEncoding:NSUTF8StringEncoding];
+    size_t outLen = [plainData length] + kCCBlockSizeAES128;
+    NSMutableData *outData = [NSMutableData dataWithLength:outLen];
+    CCCryptorStatus status = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                     keyData.bytes, kCCKeySizeAES128,
+                                     NULL, // ECB 无 IV
+                                     plainData.bytes, plainData.length,
+                                     outData.mutableBytes, outLen, &outLen);
+    if (status != kCCSuccess) {
+        NSLog(@"[CacheLogin] password AES 加密失败 status=%d", status);
+        return plain;
+    }
+    [outData setLength:outLen];
+    return [outData base64EncodedStringWithOptions:0];
+}
+
 // 写 user_info（loginTime=1/expires_in=1 → 游戏必判过期 → refresh 换新 token）
 static void writeUserInfo(NSDictionary *acct) {
     sqlite3 *db = NULL;
@@ -401,10 +423,14 @@ static void writeUserInfo(NSDictionary *acct) {
     // nickname 含特殊字符时转义单引号（其余字段为 Base64/数字/md5，无单引号）
     NSString *nick = [acct[@"nickname"] stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
     NSString *pwd = ([acct[@"password"] isKindOfClass:[NSString class]]) ? acct[@"password"] : nil;
+    if (pwd && pwd.length > 0) {
+        // v3.3.4: 明文hex(16位) → AES 加密 → 密文入库(与自然标准一致); 已是密文(44字符base64)不重复加密
+        pwd = aesEncryptPassword(pwd);
+    }
     NSString *sql;
     // v3.3.3: mobile 留空(与自然标准/frida成功版一致), account=手机号
     if (pwd && pwd.length > 0) {
-        // 老号有 password：照常写入
+        // 老号有 password：照常写入（密文）
         sql = [NSString stringWithFormat:
             @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'','%@',1,'%@','%@',1,NULL);",
             acct[@"openid"], acct[@"token"], acct[@"refresh"], nick, acct[@"phone"], pwd];
@@ -713,8 +739,8 @@ static void cacheLoginCheck(void) {
 }
 
 %ctor {
-    tlog(@"★ 插件已加载 v3.3.3，进程=%@", [[NSProcessInfo processInfo] processName]);
-    NSLog(@"[FishTweak] 插件已加载 v3.3.3");
+    tlog(@"★ 插件已加载 v3.3.4，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.3.4");
     if (!isGameProcess()) {
         // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
         tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN/缓存登录逻辑", [[NSProcessInfo processInfo] processName]);
