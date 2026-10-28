@@ -397,7 +397,8 @@ static NSString *aesEncryptPassword(NSString *plain) {
     NSData *plainData = [plain dataUsingEncoding:NSUTF8StringEncoding];
     size_t outLen = [plainData length] + kCCBlockSizeAES128;
     NSMutableData *outData = [NSMutableData dataWithLength:outLen];
-    CCCryptorStatus status = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+    CCCryptorStatus status = CCCrypt(kCCEncrypt, kCCAlgorithmAES,
+                                     kCCOptionPKCS7Padding | kCCOptionECBMode, // v3.3.5: 必须显式ECB(与游戏/自然标准一致, 默认CBC会产出不同密文)
                                      keyData.bytes, kCCKeySizeAES128,
                                      NULL, // ECB 无 IV
                                      plainData.bytes, plainData.length,
@@ -739,8 +740,8 @@ static void cacheLoginCheck(void) {
 }
 
 %ctor {
-    tlog(@"★ 插件已加载 v3.3.4，进程=%@", [[NSProcessInfo processInfo] processName]);
-    NSLog(@"[FishTweak] 插件已加载 v3.3.4");
+    tlog(@"★ 插件已加载 v3.3.5，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.3.5");
     if (!isGameProcess()) {
         // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
         tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN/缓存登录逻辑", [[NSProcessInfo processInfo] processName]);
