@@ -375,7 +375,13 @@ static void writeLoginDefaults(NSDictionary *acct) {
     NSString *lastId = acct[@"phone"];
     if (!lastId || lastId.length == 0) lastId = acct[@"account"];
     [ud setObject:lastId forKey:@"LastIDAccount"];
-    [ud setObject:acct[@"password"] forKey:@"LastPwdAccount"];
+    // v3.3.1: password 参数为空时不动 LastPwdAccount（新号无 password，让游戏客户端自己生成）
+    NSString *pwd = ([acct[@"password"] isKindOfClass:[NSString class]]) ? acct[@"password"] : nil;
+    if (pwd && pwd.length > 0) {
+        [ud setObject:pwd forKey:@"LastPwdAccount"];
+    } else {
+        NSLog(@"[CacheLogin] password 为空，跳过 LastPwdAccount 写入(让游戏生成)");
+    }
     [ud setObject:@((long long)[[NSDate date] timeIntervalSince1970]) forKey:@"ZSFirstStartupLaunchTime"];
     [ud setObject:@1 forKey:@"Login_Agree"];
     [ud synchronize];
@@ -394,9 +400,20 @@ static void writeUserInfo(NSDictionary *acct) {
     sqlite3_exec(db, createSql, NULL, NULL, NULL);
     // nickname 含特殊字符时转义单引号（其余字段为 Base64/数字/md5，无单引号）
     NSString *nick = [acct[@"nickname"] stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
-    NSString *sql = [NSString stringWithFormat:
-        @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'%@','%@',1,'%@','%@',1,NULL);",
-        acct[@"openid"], acct[@"token"], acct[@"refresh"], acct[@"phone"], nick, acct[@"phone"], acct[@"password"]];
+    NSString *pwd = ([acct[@"password"] isKindOfClass:[NSString class]]) ? acct[@"password"] : nil;
+    NSString *sql;
+    if (pwd && pwd.length > 0) {
+        // 老号有 password：照常写入
+        sql = [NSString stringWithFormat:
+            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'%@','%@',1,'%@','%@',1,NULL);",
+            acct[@"openid"], acct[@"token"], acct[@"refresh"], acct[@"phone"], nick, acct[@"phone"], pwd];
+    } else {
+        // v3.3.1: 新号无 password → 不写 password 列（NULL），让游戏客户端登录时自己生成
+        NSLog(@"[CacheLogin] password 为空，user_info 不写 password 列(让游戏生成)");
+        sql = [NSString stringWithFormat:
+            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'%@','%@',1,'%@',1,NULL);",
+            acct[@"openid"], acct[@"token"], acct[@"refresh"], acct[@"phone"], nick, acct[@"phone"]];
+    }
     char *err = NULL;
     int rc = sqlite3_exec(db, [sql UTF8String], NULL, NULL, &err);
     if (rc != SQLITE_OK) {
@@ -499,8 +516,14 @@ static id overrideLoginValueForKey(NSString *k) {
             tlog(@"HOOK LastIDAccount -> %@", ph ?: @"(空)");
             return ph ?: nil;
         } else if ([k isEqualToString:@"LastPwdAccount"]) {
-            tlog(@"HOOK LastPwdAccount -> %@", pending[@"password"] ?: @"(空)");
-            return pending[@"password"] ?: nil;
+            // v3.3.1: password 为空时不拦截，走原值（新号无 password，让游戏客户端自己生成）
+            NSString *pp = pending[@"password"];
+            if (pp && pp.length > 0) {
+                tlog(@"HOOK LastPwdAccount -> %@", pp);
+                return pp;
+            }
+            tlog(@"HOOK LastPwdAccount -> password 为空，走原值");
+            return nil;
         } else if ([k isEqualToString:@"Login_Agree"]) {
             tlog(@"HOOK Login_Agree -> 1");
             return @1;
