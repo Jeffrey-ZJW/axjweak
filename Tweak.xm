@@ -402,17 +402,18 @@ static void writeUserInfo(NSDictionary *acct) {
     NSString *nick = [acct[@"nickname"] stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
     NSString *pwd = ([acct[@"password"] isKindOfClass:[NSString class]]) ? acct[@"password"] : nil;
     NSString *sql;
+    // v3.3.3: mobile 留空(与自然标准/frida成功版一致), account=手机号
     if (pwd && pwd.length > 0) {
         // 老号有 password：照常写入
         sql = [NSString stringWithFormat:
-            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'%@','%@',1,'%@','%@',1,NULL);",
-            acct[@"openid"], acct[@"token"], acct[@"refresh"], acct[@"phone"], nick, acct[@"phone"], pwd];
+            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'','%@',1,'%@','%@',1,NULL);",
+            acct[@"openid"], acct[@"token"], acct[@"refresh"], nick, acct[@"phone"], pwd];
     } else {
         // v3.3.1: 新号无 password → 不写 password 列（NULL），让游戏客户端登录时自己生成
         NSLog(@"[CacheLogin] password 为空，user_info 不写 password 列(让游戏生成)");
         sql = [NSString stringWithFormat:
-            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'%@','%@',1,'%@',1,NULL);",
-            acct[@"openid"], acct[@"token"], acct[@"refresh"], acct[@"phone"], nick, acct[@"phone"]];
+            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'','%@',1,'%@',1,NULL);",
+            acct[@"openid"], acct[@"token"], acct[@"refresh"], nick, acct[@"phone"]];
     }
     char *err = NULL;
     int rc = sqlite3_exec(db, [sql UTF8String], NULL, NULL, &err);
@@ -712,8 +713,8 @@ static void cacheLoginCheck(void) {
 }
 
 %ctor {
-    tlog(@"★ 插件已加载 v3.3.2，进程=%@", [[NSProcessInfo processInfo] processName]);
-    NSLog(@"[FishTweak] 插件已加载 v3.3.2");
+    tlog(@"★ 插件已加载 v3.3.3，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.3.3");
     if (!isGameProcess()) {
         // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
         tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN/缓存登录逻辑", [[NSProcessInfo processInfo] processName]);
