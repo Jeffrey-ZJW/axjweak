@@ -573,6 +573,74 @@ static id overrideLoginValueForKey(NSString *k) {
 }
 %end
 
+// ========================================
+//  屏蔽按键精灵(DZZ新版)广告（v3.3 新增）
+//  广告结构（frida 实测确认）：
+//    UIWindow 直接子视图 = UIView（广告容器）
+//      ├─ UIImageView（广告图，内嵌 UIButton 关闭/跳过）
+//      └─ UIButton（点击跳转，内嵌 UIImageView 图标）
+//  命中 → 隐藏容器 + 隐藏容器所在 window（避免 key window 灰底遮挡主界面）
+// ========================================
+static BOOL isGameProcess(void) {
+    static BOOL sInit = NO, sIsGame = NO;
+    if (!sInit) {
+        sInit = YES;
+        NSString *bn = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+        sIsGame = [bn isEqualToString:@"com.gzlj.fishdecisive"];
+    }
+    return sIsGame;
+}
+
+static BOOL isDZZProcess(void) {
+    static BOOL sInit = NO, sIsDZZ = NO;
+    if (!sInit) {
+        sInit = YES;
+        NSString *bn = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+        NSString *pn = [[NSProcessInfo processInfo] processName] ?: @"";
+        sIsDZZ = [bn isEqualToString:@"com.cyjh.MobileAnjiandjz"] || [pn isEqualToString:@"DZZ新版"];
+    }
+    return sIsDZZ;
+}
+
+// 广告容器结构判定（必须是纯 UIView + window 直接子视图 + 2 子视图组合）
+static BOOL isAdBannerContainer(UIView *v) {
+    if (!v || [v class] != [UIView class]) return NO;
+    if (![v.superview isKindOfClass:[UIWindow class]]) return NO;
+    NSArray *subs = v.subviews;
+    if (subs.count != 2) return NO;
+    UIView *v0 = subs[0];
+    UIView *v1 = subs[1];
+    if (![v0 isKindOfClass:[UIImageView class]] || ![v1 isKindOfClass:[UIButton class]]) return NO;
+    BOOL v0HasBtn = NO, v1HasImg = NO;
+    for (UIView *s in v0.subviews) {
+        if ([s isKindOfClass:[UIButton class]]) { v0HasBtn = YES; break; }
+    }
+    for (UIView *s in v1.subviews) {
+        if ([s isKindOfClass:[UIImageView class]]) { v1HasImg = YES; break; }
+    }
+    return v0HasBtn && v1HasImg;
+}
+
+static void hideDZZAdIfMatch(UIView *v) {
+    if (isAdBannerContainer(v)) {
+        v.hidden = YES;
+        if ([v.superview isKindOfClass:[UIWindow class]]) {
+            v.superview.hidden = YES;
+        }
+        tlog(@"★ 屏蔽按键精灵广告: 容器+window 已隐藏");
+        NSLog(@"[FishTweak] 屏蔽按键精灵广告: 容器+window 已隐藏");
+    }
+}
+
+%hook UIView
+- (void)layoutSubviews {
+    %orig;
+    if (isDZZProcess() && self.window != nil) {
+        hideDZZAdIfMatch(self);
+    }
+}
+%end
+
 // 启动检查：有缓存(user_info 有记录) → 不介入；无缓存 → 有参数则制造；状态写盘供 daemon 查询
 static void cacheLoginCheck(void) {
     @try {
@@ -607,8 +675,13 @@ static void cacheLoginCheck(void) {
 }
 
 %ctor {
-    NSLog(@"[FishTweak] 插件已加载 v3.2.3");
-    tlog(@"★ 插件已加载 v3.2.3，进程=%@", [[NSProcessInfo processInfo] processName]);
+    tlog(@"★ 插件已加载 v3.3.0，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.3.0");
+    if (!isGameProcess()) {
+        // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
+        tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN/缓存登录逻辑", [[NSProcessInfo processInfo] processName]);
+        return;
+    }
     initFakeTimes();
 
     // ---- v2.3: sys/boot 伪造 + VPN 隐藏 ----

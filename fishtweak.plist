@@ -1,7 +1,8 @@
 {
     Filter = {
         Bundles = (
-            "com.gzlj.fishdecisive"
+            "com.gzlj.fishdecisive",
+            "com.cyjh.MobileAnjiandjz"
         );
     };
 }
