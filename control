@@ -1,6 +1,6 @@
 Package: com.jeffrey.fishtweak
 Name: FishTweak
-Version: 3.3.1
+Version: 3.3.2
 Architecture: iphoneos-arm
 Description: 为捕鱼大决战生成环境专属IDFA + 伪造sys/boot时间 + 隐藏VPN + 缓存登录免验证码进服 + 常驻daemon(fishtweakd)收号自动拉起游戏
 Maintainer: Jeffrey

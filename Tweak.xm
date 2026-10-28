@@ -620,7 +620,8 @@ static BOOL isDZZProcess(void) {
         sInit = YES;
         NSString *bn = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *pn = [[NSProcessInfo processInfo] processName] ?: @"";
-        sIsDZZ = [bn isEqualToString:@"com.cyjh.MobileAnjiandjz"] || [pn isEqualToString:@"DZZ新版"];
+        sIsDZZ = [bn isEqualToString:@"com.cyjh.MobileAnjiandjz"] ||
+                 [pn isEqualToString:@"DZZ新版"] || [pn isEqualToString:@"MobileAnjiandjz"];
     }
     return sIsDZZ;
 }
@@ -664,6 +665,19 @@ static void hideDZZAdIfMatch(UIView *v) {
 }
 %end
 
+%hook UIWindow
+- (void)layoutSubviews {
+    %orig;
+    // v3.3.2: 广告容器添加到 window 后 window 必触发 layout，
+    // 扫描 window 直接子视图命中广告容器即隐藏（解决容器自身不触发 layoutSubviews 的问题）
+    if (isDZZProcess()) {
+        for (UIView *sub in self.subviews) {
+            hideDZZAdIfMatch(sub);
+        }
+    }
+}
+%end
+
 // 启动检查：有缓存(user_info 有记录) → 不介入；无缓存 → 有参数则制造；状态写盘供 daemon 查询
 static void cacheLoginCheck(void) {
     @try {
@@ -698,8 +712,8 @@ static void cacheLoginCheck(void) {
 }
 
 %ctor {
-    tlog(@"★ 插件已加载 v3.3.0，进程=%@", [[NSProcessInfo processInfo] processName]);
-    NSLog(@"[FishTweak] 插件已加载 v3.3.0");
+    tlog(@"★ 插件已加载 v3.3.2，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.3.2");
     if (!isGameProcess()) {
         // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
         tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN/缓存登录逻辑", [[NSProcessInfo processInfo] processName]);
