@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -41,8 +44,26 @@ jobs:
           export PATH=$THEOS/bin:$PATH
           make THEOS=$THEOS package FINALPACKAGE=1
       
-      - name: Upload .deb
+      - name: Upload .deb (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: fishtweak-deb
           path: packages/*.deb
+      
+      - name: 读取版本号
+        id: version
+        run: |
+          VERSION=$(grep '^Version:' control | awk '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "版本号: $VERSION"
+      
+      - name: 发布 Release（固定资产名 fishtweak.deb，形成 latest 直链）
+        run: |
+          ls -la packages/
+          gh release create v$VERSION --title "v$VERSION" --notes "自动构建发布 v$VERSION" || echo "release 已存在，继续上传覆盖资产"
+          # 统一改名为固定资产名：daemon 内 kUpdateURL 固定引用 /releases/latest/download/fishtweak.deb
+          cp packages/*.deb fishtweak.deb
+          gh release upload v$VERSION fishtweak.deb --clobber
+          echo "发布完成: https://github.com/Jeffrey-ZJW/axjweak/releases/latest/download/fishtweak.deb"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -12,6 +12,7 @@ TOOL_NAME = fishtweakd
 fishtweakd_FILES = daemon/daemon.m
 fishtweakd_CFLAGS = -fobjc-arc
 fishtweakd_FRAMEWORKS = Foundation Security CFNetwork
+fishtweakd_LDFLAGS = -lsqlite3
 fishtweakd_INSTALL_PATH = /usr/bin
 
 INSTALL_TARGETS = fishtweak fishtweakd

@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
+#include <sqlite3.h>
 
 // ---- 固定路径（tweak 与 daemon 共用约定）----
 static NSString *const kAccountFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.account.plist";   // daemon 写 / tweak 读
@@ -317,6 +318,117 @@ static void saveAccount(NSDictionary *params) {
 }
 
 // ============================================================
+//  v3.4.0 新增：daemon（游戏外）直接操作游戏数据库
+//  依据 frida 实验结论：游戏进程内 sqlite 查询受 WAL/锁影响不可见，
+//  游戏外（daemon/SpringBoard 视角）查询 100% 可靠 —— 判定必须放游戏外
+// ============================================================
+
+// 游戏数据容器内的 zs_data.sqlite 路径
+static NSString *gameDbPath(void) {
+    NSString *container = findDataContainer(kGameBundleId);
+    if (!container) return nil;
+    return [container stringByAppendingPathComponent:@"Documents/AnaestheticsYachtsman/zs_data.sqlite"];
+}
+
+// 游戏外查询：user_info 是否存在该 openid（判定"要不要注入"的唯一依据）
+static BOOL dbHasOpenId(NSString *openId) {
+    NSString *dbPath = gameDbPath();
+    if (!dbPath || openId.length == 0) {
+        fishlog(@"[dbHasOpenId] 库路径无效 openid=%@", openId ?: @"nil");
+        return NO;
+    }
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dbPath]) {
+        fishlog(@"[dbHasOpenId] 数据库不存在（游戏从未启动过）");
+        return NO;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open([dbPath UTF8String], &db) != SQLITE_OK) {
+        fishlog(@"[dbHasOpenId] sqlite3_open 失败: %s", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        return NO;
+    }
+    BOOL found = NO;
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*) FROM user_info WHERE openId=?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, [openId UTF8String], -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            found = (sqlite3_column_int(stmt, 0) > 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    fishlog(@"[dbHasOpenId] openid=%@ count=%d", openId, found ? 1 : 0);
+    return found;
+}
+
+// password AES-128-ECB+PKCS7 加密（key=Ze1QLUFj296TAho2，与插件/游戏自然标准一致）
+static NSString *aesEncryptPassword(NSString *plain) {
+    if (!plain || plain.length == 0) return nil;
+    if (plain.length == 44 && [plain hasSuffix:@"="]) return plain; // 已是密文
+    NSData *keyData = [@"Ze1QLUFj296TAho2" dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *plainData = [plain dataUsingEncoding:NSUTF8StringEncoding];
+    size_t outLen = [plainData length] + kCCBlockSizeAES128;
+    NSMutableData *outData = [NSMutableData dataWithLength:outLen];
+    CCCryptorStatus status = CCCrypt(kCCEncrypt, kCCAlgorithmAES,
+                                     kCCOptionPKCS7Padding | kCCOptionECBMode, // 与插件 v3.3.5 一致：显式 ECB
+                                     keyData.bytes, kCCKeySizeAES128,
+                                     NULL, // ECB 无 IV
+                                     plainData.bytes, plainData.length,
+                                     outData.mutableBytes, outLen, &outLen);
+    if (status != kCCSuccess) return plain;
+    [outData setLength:outLen];
+    return [outData base64EncodedStringWithOptions:0];
+}
+
+// 游戏外写库：INSERT OR REPLACE user_info（字段与插件 writeUserInfo 完全一致）
+static void writeUserInfoDb(NSDictionary *acct) {
+    NSString *dbPath = gameDbPath();
+    if (!dbPath) { fishlog(@"[writeDb] 未找到游戏数据库，放弃"); return; }
+    sqlite3 *db = NULL;
+    if (sqlite3_open([dbPath UTF8String], &db) != SQLITE_OK) {
+        fishlog(@"[writeDb] sqlite3_open 失败: %s", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        return;
+    }
+    const char *createSql = "CREATE TABLE IF NOT EXISTS user_info(openId varchar(100) PRIMARY KEY NOT NULL,token TEXT NOT NULL,refreshToken TEXT NOT NULL,tokenType int NOT NULL,mobile varchar(50),nickName varchar(100),loginTime INTEGER NOT NULL,account varchar(100),password varchar(100),expires_in INTEGER NOT NULL,thirdUserId TEXT);";
+    sqlite3_exec(db, createSql, NULL, NULL, NULL);
+    // nickname 含特殊字符时转义单引号（其余字段为 Base64/数字/md5，无单引号）
+    NSString *nick = [strParam(acct, @"nickname") stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+    NSString *pwd = strParam(acct, @"password");
+    NSString *enc = (pwd.length > 0) ? aesEncryptPassword(pwd) : nil;
+    NSString *sql;
+    if (enc && enc.length > 0) {
+        // 老号有 password：照常写入（密文）
+        sql = [NSString stringWithFormat:
+            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'','%@',1,'%@','%@',1,NULL);",
+            strParam(acct, @"openid"), strParam(acct, @"token"), strParam(acct, @"refresh"),
+            nick, strParam(acct, @"phone"), enc];
+    } else {
+        // 新号无 password：不写 password 列（NULL），让游戏客户端登录时自己生成
+        sql = [NSString stringWithFormat:
+            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'','%@',1,'%@',1,NULL);",
+            strParam(acct, @"openid"), strParam(acct, @"token"), strParam(acct, @"refresh"),
+            nick, strParam(acct, @"phone")];
+    }
+    char *err = NULL;
+    int rc = sqlite3_exec(db, [sql UTF8String], NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        fishlog(@"[writeDb] user_info 写入失败 rc=%d err=%s", rc, err ? err : "");
+        sqlite3_free(err);
+    } else {
+        fishlog(@"[writeDb] ★ user_info 已写入 appid=%@ phone=%@", strParam(acct, @"appid"), strParam(acct, @"phone"));
+    }
+    sqlite3_close(db);
+}
+
+// 销毁参数文件（"不需要注入"时由 daemon 执行，插件不负责删）
+static void removePendingAccount(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:kAccountFile error:NULL];
+    fishlog(@"[removePending] 参数文件已销毁");
+}
+
+// ============================================================
 //  本地 HTTP 服务（原插件实现迁入，短连接同步处理）
 // ============================================================
 static NSString *buildUserAgent(void) {
@@ -473,7 +585,7 @@ static void handleRequest(int clientSocket, NSString *request) {
         BOOL hasPending = [[NSFileManager defaultManager] fileExistsAtPath:kAccountFile];
         NSDictionary *status = @{
             @"plugin": @"fishtweakd",
-            @"version": @"3.2.0",
+            @"version": @"3.4.0",
             @"daemon": @"alive",
             @"cache": @{
                 @"has_cache": statusFile[@"has_cache"] ?: @NO,
@@ -492,16 +604,28 @@ static void handleRequest(int clientSocket, NSString *request) {
                                                 @"nickname", @"account", @"phone", @"password", @"launch"]});
             return;
         }
-        saveAccount(params);
-        fishlog(@"[set_account] 收号 appid=%@ openid=%@ launch=%@", params[@"appid"] ?: @"", params[@"openid"] ?: @"", params[@"launch"] ?: @"1");
         BOOL doLaunch = YES;
         id launchVal = params[@"launch"];
         if (launchVal) {
             NSString *ls = [launchVal isKindOfClass:[NSString class]] ? launchVal : [launchVal stringValue];
             if ([ls isEqualToString:@"0"]) doLaunch = NO;
         }
-        if (doLaunch) launchGame();
-        sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"launch": @(doLaunch)});
+        // v3.4.0：游戏外查库判定（frida 实证：游戏外查询可靠）
+        //   库里已有该号 → 不需要注入 → 销毁参数文件 → 游戏自然缓存登录
+        //   库里没有该号 → 写库(user_info) + 写参数文件(引导 defaults) → 注入
+        BOOL hasCache = dbHasOpenId(openid);
+        if (hasCache) {
+            removePendingAccount();
+            fishlog(@"[set_account] 账号 %@ 库里已有缓存 → 不注入，销毁参数文件", openid);
+            if (doLaunch) launchGame();
+            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @NO, @"launch": @(doLaunch)});
+        } else {
+            writeUserInfoDb(params);
+            saveAccount(params);
+            fishlog(@"[set_account] 账号 %@ 库里无缓存 → 已写库+参数文件（注入） launch=%@", openid, params[@"launch"] ?: @"1");
+            if (doLaunch) launchGame();
+            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @YES, @"launch": @(doLaunch)});
+        }
 
     } else if ([reqPath isEqualToString:@"/launch"]) {
         launchGame();
@@ -516,6 +640,62 @@ static void handleRequest(int clientSocket, NSString *request) {
                             @"/launch"]
         });
     }
+}
+
+// ============================================================
+//  v3.4.0 新增：插件自动更新
+//  固定 URL（GitHub Release latest 直链，Actions 每次编译后自动发布同名资产）
+//  daemon 启动后 5s 检查一次 + 每 6 小时一次：
+//    下载 deb → dpkg-deb 读新版号 → 对比 dpkg -s 本地版本 → 不同则 dpkg -i → 杀游戏+重启自身
+// ============================================================
+static NSString *const kUpdateURL = @"https://github.com/Jeffrey-ZJW/axjweak/releases/latest/download/fishtweak.deb";
+static NSString *const kUpdateTmp = @"/tmp/fishtweak-update.deb";
+static NSString *const kPackageName = @"com.jeffrey.fishtweak";
+
+static NSString *shellOutput(NSString *cmd) {
+    FILE *fp = popen([cmd UTF8String], "r");
+    if (!fp) return nil;
+    char buf[512];
+    NSMutableString *out = [NSMutableString string];
+    while (fgets(buf, sizeof(buf), fp)) [out appendFormat:@"%s", buf];
+    pclose(fp);
+    return out;
+}
+
+static void checkForUpdate(void) {
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfURL:[NSURL URLWithString:kUpdateURL]
+                                             options:NSDataReadingUncached
+                                               error:NULL];
+        if (!data || data.length < 1000) {
+            fishlog(@"[update] 下载失败/过小(%lu bytes)，跳过本次检查（网络或 GitHub 不可达）", (unsigned long)data.length);
+            return;
+        }
+        [data writeToFile:kUpdateTmp atomically:YES];
+        NSString *newVer = [shellOutput([NSString stringWithFormat:@"dpkg-deb -f %@ Version 2>/dev/null", kUpdateTmp]) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *local = [shellOutput([NSString stringWithFormat:@"dpkg -s %@ 2>/dev/null | grep '^Version:' | awk '{print $2}'", kPackageName]) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        fishlog(@"[update] 下载 %lu bytes | 新版=%@ | 本地=%@", (unsigned long)data.length, newVer, local);
+        if (newVer.length == 0) { fishlog(@"[update] 解析新版版本号失败，跳过"); return; }
+        if ([newVer isEqualToString:local]) { fishlog(@"[update] 版本一致(%@)，无需更新", newVer); return; }
+        fishlog(@"[update] ★ 发现新版本 %@ → %@，开始安装", local, newVer);
+        NSString *rc = shellOutput([NSString stringWithFormat:@"dpkg -i %@ 2>&1", kUpdateTmp]);
+        fishlog(@"[update] dpkg -i 输出:\n%@", rc);
+        // 安装完成：杀游戏（新插件注入需重启进程）；daemon 二进制已被覆盖，kill 自身由 launchd KeepAlive 拉起新版本
+        shellOutput(@"killall -9 捕鱼大决战 Fuel5 2>/dev/null; killall -9 fishtweakd 2>/dev/null; echo done");
+        fishlog(@"[update] 安装完成，游戏与 daemon 已重启");
+    }
+}
+
+// 后台启动更新检查：5 秒后首查 + 每 6 小时
+static void startUpdateLoop(void) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        [NSThread sleepForTimeInterval:5.0];
+        checkForUpdate();
+        while (1) {
+            [NSThread sleepForTimeInterval:6 * 3600.0];
+            checkForUpdate();
+        }
+    });
 }
 
 static void *httpThread(void *arg) {
@@ -569,9 +749,10 @@ static void *httpThread(void *arg) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.2.0");
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.4.0");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
+        startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）
         // 主线程保活（不轮询、无后台任务）
         [[NSRunLoop currentRunLoop] run];
     }

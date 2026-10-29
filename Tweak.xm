@@ -453,12 +453,13 @@ static void writeUserInfo(NSDictionary *acct) {
     sqlite3_close(db);
 }
 
-// 制造缓存登录（defaults + user_info 一次到位，随后清除待注入参数）
+// 制造缓存登录（defaults + user_info 一次到位）
+// v3.4.0: 不再删除参数文件 —— 参数文件生命周期由 daemon 管理（喂号时写/覆盖/销毁），
+//         插件只负责消费：有参数文件则 hook 引导 defaults + 库里缺记录时兜底补写
 static void makeCacheLogin(NSDictionary *acct) {
     writeLoginDefaults(acct);
     writeUserInfo(acct);
-    clearPendingAccount();
-    NSLog(@"[CacheLogin] ★ 缓存登录已制造 appid=%@", acct[@"appid"]);
+    NSLog(@"[CacheLogin] ★ 缓存登录已制造 appid=%@（参数文件保留，由 daemon 管理生命周期）", acct[@"appid"]);
 }
 
 // ========================================
@@ -706,33 +707,42 @@ static void hideDZZAdIfMatch(UIView *v) {
 }
 %end
 
-// 启动检查：有缓存(user_info 有记录) → 不介入；无缓存 → 有参数则制造；状态写盘供 daemon 查询
+// 启动检查（v3.4.0：daemon 已负责"查库判断+写库+参数文件生命周期"，插件只做兜底）
+// 有喂号参数(pending)：
+//   库里已有该 openid → daemon 已处理（写库或老号），插件不兜底，参数文件保留(引导 defaults)
+//   库里没有该 openid → daemon 写库失败/未写时插件兜底制造（defaults + user_info）
+// 无 pending：
+//   库里已有缓存账号 → 不介入，游戏自然缓存登录
+//   库里无缓存 → 跳过；顺手清理无效残留参数文件
 static void cacheLoginCheck(void) {
     @try {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        NSString *curOpenId = [ud stringForKey:@"Login_OpenId"];
-        if (curOpenId && curOpenId.length > 0 && userInfoHasOpenId(curOpenId)) {
-            tlog(@"cacheLoginCheck: 已有缓存账号(%@)，不介入", curOpenId);
-            NSLog(@"[CacheLogin] 已有缓存账号(%@)，不介入，游戏自动缓存登录", curOpenId);
-            writeStatus(curOpenId, YES);
-            return;
-        }
         NSDictionary *pending = loadPendingAccount();
-        if (!pending) {
-            tlog(@"cacheLoginCheck: 无缓存且无待注入账号，跳过");
-            NSLog(@"[CacheLogin] 无缓存且无待注入账号，跳过");
-            writeStatus(curOpenId, NO);
-            return;
-        }
-        if (userInfoHasOpenId(pending[@"openid"])) {
-            tlog(@"cacheLoginCheck: 待注入账号 %@ 已有缓存记录，不重复制造", pending[@"openid"]);
-            NSLog(@"[CacheLogin] 待注入账号 %@ 已有缓存记录，不重复制造", pending[@"openid"]);
+        if (pending) {
+            if (userInfoHasOpenId(pending[@"openid"])) {
+                tlog(@"cacheLoginCheck: 喂的账号 %@ 库里已有缓存，插件不兜底（参数文件保留引导defaults）", pending[@"openid"]);
+                NSLog(@"[CacheLogin] 喂的账号 %@ 库里已有缓存，不兜底", pending[@"openid"]);
+                writeStatus(pending[@"openid"], YES);
+                return;
+            }
+            tlog(@"cacheLoginCheck: ★ 兜底制造缓存 appid=%@", pending[@"appid"] ?: @"?");
+            NSLog(@"[CacheLogin] 兜底制造缓存 appid=%@", pending[@"appid"] ?: @"?");
+            makeCacheLogin(pending); // 写 defaults + user_info，参数文件保留
             writeStatus(pending[@"openid"], YES);
             return;
         }
-        tlog(@"cacheLoginCheck: ★ 制造缓存 appid=%@", pending[@"appid"] ?: @"?");
-        makeCacheLogin(pending);
-        writeStatus(pending[@"openid"], YES);
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSString *curOpenId = [ud stringForKey:@"Login_OpenId"];
+        if (curOpenId && curOpenId.length > 0 && userInfoHasOpenId(curOpenId)) {
+            tlog(@"cacheLoginCheck: 无喂号，库里已有缓存账号(%@)，不介入", curOpenId);
+            NSLog(@"[CacheLogin] 无喂号，库里已有缓存账号(%@)，不介入，游戏自动缓存登录", curOpenId);
+            writeStatus(curOpenId, YES);
+            return;
+        }
+        tlog(@"cacheLoginCheck: 无喂号且无缓存账号，跳过");
+        NSLog(@"[CacheLogin] 无喂号且无缓存账号，跳过");
+        writeStatus(curOpenId, NO);
+        // 保险：loadPendingAccount 返回 nil 的残留文件（openid/refresh 为空）顺手清理
+        clearPendingAccount();
     } @catch (NSException *e) {
         tlog(@"cacheLoginCheck 异常: %@", e);
         NSLog(@"[CacheLogin] 异常: %@", e);
@@ -740,8 +750,8 @@ static void cacheLoginCheck(void) {
 }
 
 %ctor {
-    tlog(@"★ 插件已加载 v3.3.5，进程=%@", [[NSProcessInfo processInfo] processName]);
-    NSLog(@"[FishTweak] 插件已加载 v3.3.5");
+    tlog(@"★ 插件已加载 v3.4.0，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.4.0");
     if (!isGameProcess()) {
         // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
         tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN/缓存登录逻辑", [[NSProcessInfo processInfo] processName]);
