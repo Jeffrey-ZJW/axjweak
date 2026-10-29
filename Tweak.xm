@@ -92,9 +92,6 @@ static struct timeval gFakeBootTime = {0, 0};      // boot 伪值（sysctl kern.
 static struct timespec gFakeSysTime = {0, 0};      // sys 伪值（MCMeta.plist 的 st_mtime）
 static int gTweakEnabled = 1;                      // 总开关
 static int (*orig_getifaddrs)(struct ifaddrs **);  // getifaddrs 原函数指针
-// 缓存登录模块前置声明（HTTP 已迁 daemon，本进程仅保留文件通道所需）
-static NSDictionary *loadPendingAccount(void);
-static BOOL userInfoHasOpenId(NSString *openId);
 // ========================================
 //  SysFileTime + bootTimeInSec 伪造 + VPN 隐藏（v2.3 新增）
 // ========================================
@@ -274,212 +271,10 @@ static char *my_if_indextoname(unsigned int ifindex, char *ifname) {
 }
 
 // ========================================
-//  缓存登录（v3.0 新增）—— 免验证码进服
-//  流程：按键精灵 POST /set_account 传入账号参数（落盘持久化）
-//        → 每次游戏启动后 2.5s 做一次检查：
-//        → user_info 已有缓存记录 → 不介入，游戏自动跑缓存登录（过期会自动 refresh）
-//        → 无缓存记录 → 用待注入参数写 defaults + user_info 制造缓存
-//  写入公式与 frida V18(defaults)/V21(user_info) 实证完全一致：
-//    defaults: Login_OpenId=openid / Login_Name=appid / GameLastAccountId=appid
-//              LastLoginType=3 / LastIDAccount=phone / LastPwdAccount=password(md5)
-//    user_info: loginTime=1 / expires_in=1 → 游戏必判过期 → 强制 refresh 换新 token
+//  v3.6.0 起：缓存登录改为【游戏外直写】（daemon 收号 → 写容器内 plist 16键 + DB → 清 cfprefsd）
+//  游戏启动直接读到 16 键 → 跳过初始化 + 显示缓存登录，不再依赖进程内 hook。
+//  本进程（游戏/按键精灵）仅保留：IDFA伪造 / sys-boot时间伪造 / VPN隐藏 / 屏蔽按键精灵广告。
 // ========================================
-// ========================================
-//  缓存登录（v3.1 新增）—— 免验证码进服（文件通道版）
-//  流程：daemon(fishtweakd) 常驻 8888 收号 → 写参数文件
-//        → 按键精灵传号后 daemon 自动拉起游戏
-//        → 游戏启动后 2.5s 做一次检查：
-//        → user_info 已有缓存记录 → 不介入，游戏自动跑缓存登录（过期会自动 refresh）
-//        → 无缓存记录 → 读参数文件写 defaults + user_info 制造缓存 → 删参数文件
-//  写入公式与 frida V18(defaults)/V21(user_info) 实证完全一致：
-//    defaults: Login_OpenId=openid / Login_Name=appid / GameLastAccountId=appid
-//              LastLoginType=3 / LastIDAccount=phone / LastPwdAccount=password(md5)
-//    user_info: loginTime=1 / expires_in=1 → 游戏必判过期 → 强制 refresh 换新 token
-// ========================================
-// 与 daemon(fishtweakd) 约定共享的固定路径
-static NSString *const kAccountFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.account.plist";  // daemon 写 / tweak 读
-static NSString *const kStatusFile  = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.status.plist";   // tweak 写 / daemon 读
-
-static NSDictionary *loadPendingAccount(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kAccountFile];
-    if (!d || ![d[@"openid"] length] || ![d[@"refresh"] length]) return nil;
-    return d;
-}
-
-static void clearPendingAccount(void) {
-    [[NSFileManager defaultManager] removeItemAtPath:kAccountFile error:NULL];
-    NSLog(@"[CacheLogin] 参数文件已删除");
-}
-
-// 状态写盘（daemon 的 /status 接口读取，按键精灵据此判断是否传号）
-static void writeStatus(NSString *curOpenId, BOOL hasCache) {
-    NSDictionary *s = @{@"has_cache": @(hasCache), @"cache_openid": curOpenId ?: @""};
-    [s writeToFile:kStatusFile atomically:YES];
-}
-
-static NSString *cacheDbPath(void) {
-    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/AnaestheticsYachtsman/zs_data.sqlite"] stringByStandardizingPath];
-}
-
-// user_info 是否存在该 openId 记录（有无缓存 = 以此为准）
-static BOOL userInfoHasOpenId(NSString *openId) {
-    if (!openId || openId.length == 0) return NO;
-    sqlite3 *db = NULL;
-    if (sqlite3_open([cacheDbPath() UTF8String], &db) != SQLITE_OK) {
-        NSLog(@"[CacheLogin] sqlite3_open 失败: %s", sqlite3_errmsg(db));
-        if (db) sqlite3_close(db);
-        return NO;
-    }
-    const char *sql = "SELECT COUNT(*) FROM user_info WHERE openId=?;";
-    sqlite3_stmt *stmt = NULL;
-    BOOL found = NO;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, [openId UTF8String], -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            found = (sqlite3_column_int(stmt, 0) > 0);
-        }
-    }
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return found;
-}
-
-// user_info 表是否已有任意缓存账号（防止"二次启动/无 pending"时仍被首启判定拦截）
-static BOOL hasAnyCachedAccount(void) {
-    sqlite3 *db = NULL;
-    if (sqlite3_open([cacheDbPath() UTF8String], &db) != SQLITE_OK) {
-        if (db) sqlite3_close(db);
-        return NO;
-    }
-    const char *sql = "SELECT COUNT(*) FROM user_info;";
-    sqlite3_stmt *stmt = NULL;
-    BOOL found = NO;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            found = (sqlite3_column_int(stmt, 0) > 0);
-        }
-    }
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return found;
-}
-
-// 写游戏域 defaults（登录页显示名 = "玩家"+appid，nickName 保持"用户XXXX"由 user_info 决定）
-// v3.2: 补齐 ZSFirstStartupLaunchTime(当前时间戳) + Login_Agree(1) —— 未初始化环境直接骗过"首启判定"
-static void writeLoginDefaults(NSDictionary *acct) {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setObject:acct[@"openid"] forKey:@"Login_OpenId"];
-    [ud setObject:[NSString stringWithFormat:@"玩家%@", acct[@"appid"]] forKey:@"Login_Name"];
-    [ud setObject:acct[@"appid"] forKey:@"GameLastAccountId"];
-    [ud setInteger:3 forKey:@"LastLoginType"];
-    NSString *lastId = acct[@"phone"];
-    if (!lastId || lastId.length == 0) lastId = acct[@"account"];
-    [ud setObject:lastId forKey:@"LastIDAccount"];
-    // v3.3.1: password 参数为空时不动 LastPwdAccount（新号无 password，让游戏客户端自己生成）
-    NSString *pwd = ([acct[@"password"] isKindOfClass:[NSString class]]) ? acct[@"password"] : nil;
-    if (pwd && pwd.length > 0) {
-        [ud setObject:pwd forKey:@"LastPwdAccount"];
-    } else {
-        NSLog(@"[CacheLogin] password 为空，跳过 LastPwdAccount 写入(让游戏生成)");
-    }
-    [ud setObject:@((long long)[[NSDate date] timeIntervalSince1970]) forKey:@"ZSFirstStartupLaunchTime"];
-    [ud setObject:@1 forKey:@"Login_Agree"];
-    [ud synchronize];
-    NSLog(@"[CacheLogin] defaults 已写回(玩家%@/%@)", acct[@"appid"], lastId);
-}
-
-// v3.3.4: password 明文hex(16位) → AES-128-ECB+PKCS7 加密 → base64密文（与游戏/自然标准一致）
-// key=Ze1QLUFj296TAho2；已为 44 字符 base64 密文则直接返回，不重复加密
-static NSString *aesEncryptPassword(NSString *plain) {
-    if (!plain || plain.length == 0) return nil;
-    if (plain.length == 44 && [plain hasSuffix:@"="]) return plain; // 已是密文
-    NSData *keyData = [@"Ze1QLUFj296TAho2" dataUsingEncoding:NSUTF8StringEncoding];
-    NSData *plainData = [plain dataUsingEncoding:NSUTF8StringEncoding];
-    size_t outLen = [plainData length] + kCCBlockSizeAES128;
-    NSMutableData *outData = [NSMutableData dataWithLength:outLen];
-    CCCryptorStatus status = CCCrypt(kCCEncrypt, kCCAlgorithmAES,
-                                     kCCOptionPKCS7Padding | kCCOptionECBMode, // v3.3.5: 必须显式ECB(与游戏/自然标准一致, 默认CBC会产出不同密文)
-                                     keyData.bytes, kCCKeySizeAES128,
-                                     NULL, // ECB 无 IV
-                                     plainData.bytes, plainData.length,
-                                     outData.mutableBytes, outLen, &outLen);
-    if (status != kCCSuccess) {
-        NSLog(@"[CacheLogin] password AES 加密失败 status=%d", status);
-        return plain;
-    }
-    [outData setLength:outLen];
-    return [outData base64EncodedStringWithOptions:0];
-}
-
-// 写 user_info（loginTime=1/expires_in=1 → 游戏必判过期 → refresh 换新 token）
-static void writeUserInfo(NSDictionary *acct) {
-    sqlite3 *db = NULL;
-    if (sqlite3_open([cacheDbPath() UTF8String], &db) != SQLITE_OK) {
-        NSLog(@"[CacheLogin] sqlite3_open 失败: %s", sqlite3_errmsg(db));
-        if (db) sqlite3_close(db);
-        return;
-    }
-    const char *createSql = "CREATE TABLE IF NOT EXISTS user_info(openId varchar(100) PRIMARY KEY NOT NULL,token TEXT NOT NULL,refreshToken TEXT NOT NULL,tokenType int NOT NULL,mobile varchar(50),nickName varchar(100),loginTime INTEGER NOT NULL,account varchar(100),password varchar(100),expires_in INTEGER NOT NULL,thirdUserId TEXT);";
-    sqlite3_exec(db, createSql, NULL, NULL, NULL);
-    // nickname 含特殊字符时转义单引号（其余字段为 Base64/数字/md5，无单引号）
-    NSString *nick = [acct[@"nickname"] stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
-    NSString *pwd = ([acct[@"password"] isKindOfClass:[NSString class]]) ? acct[@"password"] : nil;
-    if (pwd && pwd.length > 0) {
-        // v3.3.4: 明文hex(16位) → AES 加密 → 密文入库(与自然标准一致); 已是密文(44字符base64)不重复加密
-        pwd = aesEncryptPassword(pwd);
-    }
-    NSString *sql;
-    // v3.3.3: mobile 留空(与自然标准/frida成功版一致), account=手机号
-    if (pwd && pwd.length > 0) {
-        // 老号有 password：照常写入（密文）
-        sql = [NSString stringWithFormat:
-            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,password,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'','%@',1,'%@','%@',1,NULL);",
-            acct[@"openid"], acct[@"token"], acct[@"refresh"], nick, acct[@"phone"], pwd];
-    } else {
-        // v3.3.1: 新号无 password → 不写 password 列（NULL），让游戏客户端登录时自己生成
-        NSLog(@"[CacheLogin] password 为空，user_info 不写 password 列(让游戏生成)");
-        sql = [NSString stringWithFormat:
-            @"INSERT OR REPLACE INTO user_info(openId,token,refreshToken,tokenType,mobile,nickName,loginTime,account,expires_in,thirdUserId) VALUES('%@','%@','%@',2,'','%@',1,'%@',1,NULL);",
-            acct[@"openid"], acct[@"token"], acct[@"refresh"], nick, acct[@"phone"]];
-    }
-    char *err = NULL;
-    int rc = sqlite3_exec(db, [sql UTF8String], NULL, NULL, &err);
-    if (rc != SQLITE_OK) {
-        NSLog(@"[CacheLogin] user_info 写入失败 rc=%d err=%s", rc, err ? err : "");
-        sqlite3_free(err);
-    } else {
-        NSLog(@"[CacheLogin] ★ user_info 缓存账号已写入(%@/%@)", acct[@"appid"], acct[@"phone"]);
-    }
-    sqlite3_close(db);
-}
-
-// 制造缓存登录（defaults + user_info 一次到位）
-// v3.4.0: 不再删除参数文件 —— 参数文件生命周期由 daemon 管理（喂号时写/覆盖/销毁），
-//         插件只负责消费：有参数文件则 hook 引导 defaults + 库里缺记录时兜底补写
-static void makeCacheLogin(NSDictionary *acct) {
-    writeLoginDefaults(acct);
-    writeUserInfo(acct);
-    NSLog(@"[CacheLogin] ★ 缓存登录已制造 appid=%@（参数文件保留，由 daemon 管理生命周期）", acct[@"appid"]);
-}
-
-// ========================================
-//  v3.2 新增：NSUserDefaults 读取 hook（frida 实证方案，任何环境/时机都显示缓存）
-//  有待注入账号参数时（参数文件存在）：
-//    ZSFirstStartupLaunchTime → 当前时间戳（骗过"首次启动"判定，未初始化环境直出缓存）
-//    Login_Agree → 1 / LastLoginType → 3
-//    Login_OpenId / Login_Name("玩家"+appid) / GameLastAccountId / LastIDAccount / LastPwdAccount → 目标值
-//  无参数文件时全部走原实现（零干扰）
-// ========================================
-// ========================================
-// 判断是否是缓存登录相关键（非相关键零开销直通，避免每次读参数文件）
-static BOOL isLoginRelatedKey(NSString *k) {
-    if (!k || k.length == 0) return NO;
-    return [k isEqualToString:@"Login_OpenId"] || [k isEqualToString:@"Login_Name"] ||
-           [k isEqualToString:@"GameLastAccountId"] || [k isEqualToString:@"LastIDAccount"] ||
-           [k isEqualToString:@"LastPwdAccount"] || [k isEqualToString:@"ZSFirstStartupLaunchTime"] ||
-           [k isEqualToString:@"Login_Agree"] || [k isEqualToString:@"LastLoginType"];
-}
-
 // ---- tweak 文件日志（老 iOS 无 log 命令，写文件最稳；诊断 hook 是否触发）----
 static NSString *const kTweakLogFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.tweak.log";
 static void tlog(NSString *fmt, ...) {
@@ -499,131 +294,8 @@ static void tlog(NSString *fmt, ...) {
     }
 }
 
-// v3.2.3 统一拦截：返回非 nil 表示本次读取应被替换（nil = 走 %orig 原实现）
-//  - ZSFirstStartupLaunchTime：pending 在 或 user_info 已有缓存 → 返回当前时间戳（骗过"首次启动"判定）
-//  - Login_OpenId / Login_Name / GameLastAccountId / LastIDAccount / LastPwdAccount / Login_Agree / LastLoginType → 目标值
-//  - 注意：hook 内只读不写（写盘仅由异步 cacheLoginCheck 做，避免 NSUserDefaults 读内嵌写死锁）
-static id overrideLoginValueForKey(NSString *k) {
-    if (!isLoginRelatedKey(k)) {
-        // 只记录前 15 个非登录键，确认游戏确实在走 NSUserDefaults 读流程
-        static int sDiagCount = 0;
-        if (sDiagCount < 15) {
-            sDiagCount++;
-            tlog(@"READ %@ (非登录键, 第%d个)", k, sDiagCount);
-        }
-        return nil;
-    }
-    @try {
-        NSDictionary *pending = loadPendingAccount();
-        if ([k isEqualToString:@"ZSFirstStartupLaunchTime"]) {
-            if (pending || hasAnyCachedAccount()) {
-                tlog(@"HOOK ZSFirstStartupLaunchTime -> 当前时间戳 (pending=%d hasCache=1)", pending != nil);
-                return @((long long)[[NSDate date] timeIntervalSince1970]);
-            }
-            tlog(@"HOOK ZSFirstStartupLaunchTime -> 无 pending 无缓存，走原值");
-            return nil;
-        }
-        if (!pending) {
-            tlog(@"HOOK 读到 %@ -> 无 pending，走原值", k);
-            return nil;
-        }
-        if ([k isEqualToString:@"Login_OpenId"]) {
-            tlog(@"HOOK Login_OpenId -> %@", pending[@"openid"] ?: @"(空)");
-            return pending[@"openid"] ?: @"";
-        } else if ([k isEqualToString:@"Login_Name"]) {
-            NSString *appid = pending[@"appid"];
-            if (appid && appid.length > 0) {
-                tlog(@"HOOK Login_Name -> 玩家%@", appid);
-                return [NSString stringWithFormat:@"玩家%@", appid];
-            }
-        } else if ([k isEqualToString:@"GameLastAccountId"]) {
-            tlog(@"HOOK GameLastAccountId -> %@", pending[@"appid"] ?: @"(空)");
-            return pending[@"appid"] ?: nil;
-        } else if ([k isEqualToString:@"LastIDAccount"]) {
-            NSString *ph = pending[@"phone"];
-            if (!ph || ph.length == 0) ph = pending[@"account"];
-            tlog(@"HOOK LastIDAccount -> %@", ph ?: @"(空)");
-            return ph ?: nil;
-        } else if ([k isEqualToString:@"LastPwdAccount"]) {
-            // v3.3.1: password 为空时不拦截，走原值（新号无 password，让游戏客户端自己生成）
-            NSString *pp = pending[@"password"];
-            if (pp && pp.length > 0) {
-                tlog(@"HOOK LastPwdAccount -> %@", pp);
-                return pp;
-            }
-            tlog(@"HOOK LastPwdAccount -> password 为空，走原值");
-            return nil;
-        } else if ([k isEqualToString:@"Login_Agree"]) {
-            tlog(@"HOOK Login_Agree -> 1");
-            return @1;
-        } else if ([k isEqualToString:@"LastLoginType"]) {
-            tlog(@"HOOK LastLoginType -> 3");
-            return @3;
-        }
-    } @catch (NSException *e) {
-        tlog(@"HOOK 异常: %@", e);
-    }
-    return nil;
-}
-
-%hook NSUserDefaults
-- (id)objectForKey:(NSString *)defaultName {
-    id v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    return ov ? ov : v;
-}
-- (NSString *)stringForKey:(NSString *)defaultName {
-    NSString *v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    if (!ov) return v;
-    if ([ov isKindOfClass:[NSString class]]) return ov;
-    if ([ov isKindOfClass:[NSNumber class]]) return [ov stringValue];
-    return v;
-}
-- (NSInteger)integerForKey:(NSString *)defaultName {
-    NSInteger v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    if (!ov) return v;
-    if ([ov isKindOfClass:[NSNumber class]]) return [ov integerValue];
-    if ([ov isKindOfClass:[NSString class]]) return [ov integerValue];
-    return v;
-}
-- (BOOL)boolForKey:(NSString *)defaultName {
-    BOOL v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    if (!ov) return v;
-    if ([ov isKindOfClass:[NSNumber class]]) return [ov boolValue];
-    return v;
-}
-- (double)doubleForKey:(NSString *)defaultName {
-    double v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    if (!ov) return v;
-    if ([ov isKindOfClass:[NSNumber class]]) return [ov doubleValue];
-    if ([ov isKindOfClass:[NSString class]]) return [ov doubleValue];
-    return v;
-}
-- (NSArray *)arrayForKey:(NSString *)defaultName {
-    NSArray *v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    return ov ? ov : v;
-}
-- (NSDictionary *)dictionaryForKey:(NSString *)defaultName {
-    NSDictionary *v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    return ov ? ov : v;
-}
-- (NSData *)dataForKey:(NSString *)defaultName {
-    NSData *v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    return ov ? ov : v;
-}
-- (NSURL *)URLForKey:(NSString *)defaultName {
-    NSURL *v = %orig;
-    id ov = overrideLoginValueForKey(defaultName ?: @"");
-    return ov ? ov : v;
-}
-%end
+// v3.6.0：缓存登录不再需要 NSUserDefaults 读取 hook（游戏外直写 16 键已完成），
+// 本进程仅保留 sys/boot/VPN/IDFA/广告屏蔽 hook。
 
 // ========================================
 //  屏蔽按键精灵(DZZ新版)广告（v3.3 新增）
@@ -707,54 +379,14 @@ static void hideDZZAdIfMatch(UIView *v) {
 }
 %end
 
-// 启动检查（v3.4.0：daemon 已负责"查库判断+写库+参数文件生命周期"，插件只做兜底）
-// 有喂号参数(pending)：
-//   库里已有该 openid → daemon 已处理（写库或老号），插件不兜底，参数文件保留(引导 defaults)
-//   库里没有该 openid → daemon 写库失败/未写时插件兜底制造（defaults + user_info）
-// 无 pending：
-//   库里已有缓存账号 → 不介入，游戏自然缓存登录
-//   库里无缓存 → 跳过；顺手清理无效残留参数文件
-static void cacheLoginCheck(void) {
-    @try {
-        NSDictionary *pending = loadPendingAccount();
-        if (pending) {
-            if (userInfoHasOpenId(pending[@"openid"])) {
-                tlog(@"cacheLoginCheck: 喂的账号 %@ 库里已有缓存，插件不兜底（参数文件保留引导defaults）", pending[@"openid"]);
-                NSLog(@"[CacheLogin] 喂的账号 %@ 库里已有缓存，不兜底", pending[@"openid"]);
-                writeStatus(pending[@"openid"], YES);
-                return;
-            }
-            tlog(@"cacheLoginCheck: ★ 兜底制造缓存 appid=%@", pending[@"appid"] ?: @"?");
-            NSLog(@"[CacheLogin] 兜底制造缓存 appid=%@", pending[@"appid"] ?: @"?");
-            makeCacheLogin(pending); // 写 defaults + user_info，参数文件保留
-            writeStatus(pending[@"openid"], YES);
-            return;
-        }
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        NSString *curOpenId = [ud stringForKey:@"Login_OpenId"];
-        if (curOpenId && curOpenId.length > 0 && userInfoHasOpenId(curOpenId)) {
-            tlog(@"cacheLoginCheck: 无喂号，库里已有缓存账号(%@)，不介入", curOpenId);
-            NSLog(@"[CacheLogin] 无喂号，库里已有缓存账号(%@)，不介入，游戏自动缓存登录", curOpenId);
-            writeStatus(curOpenId, YES);
-            return;
-        }
-        tlog(@"cacheLoginCheck: 无喂号且无缓存账号，跳过");
-        NSLog(@"[CacheLogin] 无喂号且无缓存账号，跳过");
-        writeStatus(curOpenId, NO);
-        // 保险：loadPendingAccount 返回 nil 的残留文件（openid/refresh 为空）顺手清理
-        clearPendingAccount();
-    } @catch (NSException *e) {
-        tlog(@"cacheLoginCheck 异常: %@", e);
-        NSLog(@"[CacheLogin] 异常: %@", e);
-    }
-}
+// v3.6.0：缓存登录检查移除（daemon 游戏外直写 16 键 plist + DB 已完成，无需进程内兜底）
 
 %ctor {
-    tlog(@"★ 插件已加载 v3.4.0，进程=%@", [[NSProcessInfo processInfo] processName]);
-    NSLog(@"[FishTweak] 插件已加载 v3.4.0");
+    tlog(@"★ 插件已加载 v3.6.0，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.6.0");
     if (!isGameProcess()) {
         // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
-        tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN/缓存登录逻辑", [[NSProcessInfo processInfo] processName]);
+        tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN 逻辑", [[NSProcessInfo processInfo] processName]);
         return;
     }
     initFakeTimes();
@@ -785,8 +417,5 @@ static void cacheLoginCheck(void) {
         NSLog(@"[FishTweak] 预热完成，当前环境 IDFA: %@", uuid);
     });
 
-    // v3.1: 启动 1.2s 后兜底检查缓存登录（HTTP 已迁 daemon，本进程只做读文件/制造/状态写盘）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        cacheLoginCheck();
-    });
+    // v3.6.0：缓存登录由 daemon 游戏外直写 16 键 plist + DB 完成，本进程不再做兜底检查
 }

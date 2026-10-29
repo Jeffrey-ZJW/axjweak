@@ -1,51 +1,64 @@
-﻿FishTweak v3.4.0
+﻿FishTweak v3.6.0
 ================
 捕鱼大决战专用插件（com.gzlj.fishdecisive）
 
 架构：
   - fishtweak（tweak）：注入游戏进程，IDFA伪造 + sys/boot时间伪造 + VPN隐身
-    + 缓存登录（NSUserDefaults读取hook兜底，参数文件存在时引导 defaults；库里缺记录时兜底补写）
-  - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / 写库 / 拉起游戏 / 状态查询 / 自动更新
+    + 屏蔽按键精灵(DZZ新版)广告
+    （v3.6.0 起缓存登录不再走进程内 hook，改为游戏外直写）
+  - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / 游戏外直写
+    16键plist+数据库 / 拉起游戏 / 状态查询 / 自动更新
     + 老功能（发送短信 / 重置密码）迁入
+
+【缓存登录新机制 v3.6.0（决定性突破）】
+  按键精灵喂号 → daemon 收号：
+    1) 查游戏数据库（<容器>/Documents/AnaestheticsYachtsman/zs_data.sqlite）有无该 openid
+       - 有 → 只更新 DB（token/refresh 可能轮换），不写 plist → 游戏自然缓存登录
+       - 没有 → 写 DB + 写【容器内】plist 16 键 + 清 cfprefsd → 拉起/等手动开游戏
+    2) 游戏启动直接读到 16 键 → 跳过初始化界面 + 显示缓存登录（"玩家XXX"+更换账号）
+       → 点击缓存账号 → 进服
+  16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
+    基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
+    状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
+    缓存8：Login_OpenId / Login_Name(玩家+appid) / Login_User / GameLastAccountId
+           / LastIDAccount(手机号) / LastPwdAccount / LastLoginType / Login_Type
+  注意：
+    - plist 必须写【游戏容器内】Library/Preferences/com.gzlj.fishdecisive.plist
+      （游戏只读容器内；/var/mobile/Library/Preferences 下的是全局域，游戏不读，已自动删除）
+    - KEY_ONLINE_STATE_213 必须和其他键一起全给（单独/部分给会卡加载）
+    - 写完后必须清 cfprefsd（已内置），否则游戏读缓存不到新值
 
 常驻 daemon 接口（127.0.0.1:8888）：
 1. 收号并拉起游戏（缓存登录用）:
-   http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=&launch=1
-   - launch=1 收号后自动拉起游戏；launch=0 只收号不拉起
-   - v3.4.0 起 daemon 在游戏外查库判定：
-      库里没有该号 → 写 user_info + 写参数文件（注入），游戏启动后走缓存登录
-      库里已有该号 → 不注入，销毁参数文件，游戏自然缓存登录
-   - 返回 injected: true/false 表示本次是否执行了注入
-
+   http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=5794402&launch=1
+   - launch=1 收号后自动拉起游戏；launch=0 只收号不拉起（用户手动开游戏）
+   - 返回 injected: true/false 表示本次是否执行了注入（写 plist+DB）
 2. 只拉起游戏:
    http://127.0.0.1:8888/launch
-
-3. 查询状态（按键精灵判断是否已传号/有无缓存）:
+3. 查询状态（按键精灵判断有无缓存）:
    http://127.0.0.1:8888/status
-   返回: {"cache":{"has_cache":true,"cache_openid":"...","pending_account":true}}
-
+   返回: {"cache":{"has_cache":true,"cache_openid":"...","pending_account":false}}
 4. 发送改密码短信（老功能）:
    http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
-
 5. 重置密码（老功能）:
    http://127.0.0.1:8888/reset_password?mobile=手机号&code=验证码&password=明文密码&uuid=设备UUID
 
-自动更新（v3.4.0 新增）:
+自动更新（v3.4.0 保留，v3.6.0 继续）:
   - daemon 启动 5 秒后 + 每 6 小时检查一次:
     https://github.com/Jeffrey-ZJW/axjweak/releases/latest/download/fishtweak.deb
   - 版本不同 → 自动 dpkg -i 安装 → 杀游戏与 daemon（launchd 自动拉起新版）
   - 无需手动逐个装包；GitHub 不可达时跳过，下次再查
 
 按键精灵调用示例：
-  Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=&launch=1")
+  Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=5794402&launch=1")
   Url.Get("http://127.0.0.1:8888/status")
 
-缓存登录机制（实测验证）:
-  - user_info 表（<沙盒>/Documents/AnaestheticsYachtsman/zs_data.sqlite）写入目标号，
-    loginTime=1 / expires_in=1 → 游戏必判过期 → 自动 refresh 换新 token → 握手进服
-  - 写入由 daemon 在游戏外完成（frida 实证：游戏外查询/写入可靠，游戏内查询受 WAL 影响不可见）
-  - NSUserDefaults hook 兜底：游戏读 Login_OpenId/Login_Name(玩家+appid)/GameLastAccountId/
-    LastIDAccount/LastPwdAccount/LastLoginType/ZSFirstStartupLaunchTime/Login_Agree 时
-    有待注入账号则动态返回目标值 → 未初始化/已初始化环境都直接显示缓存
-  - 参数文件生命周期由 daemon 管理：喂号时写/覆盖，库里已有该号时销毁
-  - 密码参数：16位 = md5 明文后取中间16位（如 md5("7057796")→840b7a83acfbe993）
+老功能（保留）：
+  - IDFA 伪造：LSApplicationWorkspace/ASIdentifierManager advertisingIdentifier 拦截
+  - sys/boot 时间伪造：sysctl kern.boottime + MCMeta.plist stat 时间
+  - VPN 隐身：getifaddrs/if_nametoindex/if_nameindex/if_indextoname 摘除 utun/ipsec/ppp 接口
+  - 屏蔽按键精灵(DZZ新版)广告：UIView/UIWindow layoutSubviews 命中广告容器隐藏
+
+密码参数说明：
+  - password 参数 = phonepass（如 5794402），写入 plist 的 LastPwdAccount
+  - DB user_info.password = AES-128-ECB+PKCS7 密文（key=Ze1QLUFj296TAho2），daemon 自动加密

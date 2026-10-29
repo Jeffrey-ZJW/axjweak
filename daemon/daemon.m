@@ -22,13 +22,12 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
 #include <sqlite3.h>
 
-// ---- 固定路径（tweak 与 daemon 共用约定）----
-static NSString *const kAccountFile = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.account.plist";   // daemon 写 / tweak 读
-static NSString *const kStatusFile  = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.status.plist";    // tweak 写 / daemon 读
+// ---- 固定路径（daemon 自用：日志；v3.6.0 起不再有"参数文件/状态文件"机制，缓存登录改为游戏外直写）----
 static NSString *const kLogFile     = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweakd.log";            // daemon 运行日志
 static NSString *const kGameBundleId = @"com.gzlj.fishdecisive";
 
@@ -138,8 +137,6 @@ static void launchGame(void) {
     NSString *exe = findGameBinaryPath();
     fishlog(@"[launchGame] findGameBinaryPath -> %@", exe ?: @"nil");
     BOOL started = NO;
-    // 【测试】强制 posix_spawn + DYLD_INSERT_LIBRARIES（绕过 substitute 注入）
-    if (1) { fishlog(@"[launchGame] FORCE_DYL=1 跳过 SpringBoard 通道，直接 posix_spawn + DYLD_INSERT_LIBRARIES"); goto posixSpawnDirect; }
     @try {
         Class svcClass = NSClassFromString(@"FBSOpenApplicationService");
         Class infoClass = NSClassFromString(@"FBSApplicationInfo");
@@ -261,13 +258,13 @@ static void launchGame(void) {
     }
 
 posixSpawnDirect:
-    // ---- posix_spawn（完整容器环境 + DYLD_INSERT_LIBRARIES 强制注入）----
+    // ---- posix_spawn（完整容器环境；v3.6.0 不再 DYLD 强制注入，游戏外直写已完成缓存制造）----
     if (!exe) { fishlog(@"[launchGame] 未找到游戏二进制，放弃"); return; }
     NSString *container = findDataContainer(kGameBundleId);
     fishlog(@"[launchGame] data 容器: %@", container ?: @"未找到");
     pid_t pid = 0;
     char *argv[] = {(char *)[exe UTF8String], NULL};
-    char envTmp[1024], envBundle[1024], envHome[1024], envFixed[1024], envDyl[1024];
+    char envTmp[1024], envBundle[1024], envHome[1024], envFixed[1024];
     char *envp[11];
     int ei = 0;
     if (container) {
@@ -285,9 +282,6 @@ posixSpawnDirect:
         envp[ei++] = (char *)"CFFIXED_USER_HOME=/var/mobile";
     }
     envp[ei++] = (char *)"XPC_SERVICE_NAME=0";
-    // 【强制注入】dyld 启动早期直接加载插件，绕过 substitute 的 plist 匹配
-    snprintf(envDyl, sizeof(envDyl), "DYLD_INSERT_LIBRARIES=/Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib");
-    envp[ei++] = envDyl;
     envp[ei] = NULL;
     int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, argv, envp);
     fishlog(@"[launchGame] posix_spawn rc=%d pid=%d (%s)", rc, (int)pid, rc == 0 ? "OK" : strerror(rc));
@@ -307,20 +301,6 @@ static NSString *strParam(NSDictionary *p, NSString *key) {
     if (!v || [v isKindOfClass:[NSNull class]]) return @"";
     if ([v isKindOfClass:[NSString class]]) return v;
     return [v stringValue];
-}
-static void saveAccount(NSDictionary *params) {
-    NSMutableDictionary *acct = [NSMutableDictionary dictionaryWithCapacity:8];
-    acct[@"appid"]    = strParam(params, @"appid");
-    acct[@"openid"]   = strParam(params, @"openid");
-    acct[@"refresh"]  = strParam(params, @"refresh");
-    acct[@"token"]    = strParam(params, @"token");
-    acct[@"nickname"] = strParam(params, @"nickname");
-    acct[@"account"]  = strParam(params, @"account");
-    acct[@"phone"]    = strParam(params, @"phone");
-    acct[@"password"] = strParam(params, @"password");
-    BOOL ok = [acct writeToFile:kAccountFile atomically:YES];
-    chmod([kAccountFile UTF8String], 0644);
-    NSLog(@"[FishTweakD] 账号参数已保存 openid=%@ ok=%d", acct[@"openid"], ok);
 }
 
 // ============================================================
@@ -428,10 +408,77 @@ static void writeUserInfoDb(NSDictionary *acct) {
     sqlite3_close(db);
 }
 
-// 销毁参数文件（"不需要注入"时由 daemon 执行，插件不负责删）
-static void removePendingAccount(void) {
-    [[NSFileManager defaultManager] removeItemAtPath:kAccountFile error:NULL];
-    fishlog(@"[removePending] 参数文件已销毁");
+// ============================================================
+//  v3.6.0 新增：游戏外直写【容器内 plist】（16 键）
+//  依据 2026-10-30 frida 递减实验结论：
+//    基础4（ZSFirst/LAST_LAUNCH/InstallVer/Agree）+ 状态4（SDK/ONLINE/device_id/session_count）
+//    + 缓存8（OpenId/Name/User/GameAcc/LastID/LastPwd/LastLoginType/LoginType）= 16 键全量
+//    → 游戏直接跳过初始化界面 + 显示缓存登录（玩家XXX+更换账号）
+//  键类型与 frida 实证一致：字符串用 NSString、整型用 NSNumber
+// ============================================================
+
+// 写游戏容器内 plist（16 键全量）并删除全局域同名 plist（游戏只读容器内，全局域是误写位置）
+static void writeGamePrefs(NSDictionary *acct) {
+    NSString *container = findDataContainer(kGameBundleId);
+    if (!container) { fishlog(@"[writePrefs] 未找到游戏容器，放弃"); return; }
+
+    // 1) 删除全局域同名 plist（游戏不读，避免与容器内混淆）
+    NSString *globalPlist = @"/var/mobile/Library/Preferences/com.gzlj.fishdecisive.plist";
+    if ([[NSFileManager defaultManager] fileExistsAtPath:globalPlist]) {
+        [[NSFileManager defaultManager] removeItemAtPath:globalPlist error:NULL];
+        fishlog(@"[writePrefs] 已删除全局域 plist（游戏不读该位置）");
+    }
+
+    // 2) 写容器内 plist（16 键全量）
+    NSString *prefDir  = [container stringByAppendingPathComponent:@"Library/Preferences"];
+    NSString *plistPath = [prefDir stringByAppendingPathComponent:@"com.gzlj.fishdecisive.plist"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:prefDir
+                             withIntermediateDirectories:YES attributes:nil error:NULL];
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    [df setDateFormat:@"yyyyMMdd"];
+    NSString *today = [df stringFromDate:[NSDate date]];
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithCapacity:16];
+    // 基础4：首启时间 / 上次启动 / 安装版本 / 同意协议
+    d[@"ZSFirstStartupLaunchTime"] = @((long long)[[NSDate date] timeIntervalSince1970]);
+    d[@"LAST_LAUNCH_GAME_TIME"]    = today;
+    d[@"InstallAppVersion"]        = @"2.13";
+    d[@"Login_Agree"]              = @1;
+    // 状态4：SDK初始化 / 在线状态 / 设备ID / 启动次数（必须全给，部分给会卡加载）
+    d[@"LoginInitSDK"]             = @(-1);
+    d[@"KEY_ONLINE_STATE_213"]     = @1;
+    d[@"device_id"]                = [[NSUUID UUID] UUIDString];
+    d[@"unity.player_session_count"] = @1;
+    // 缓存8：账号缓存信息
+    d[@"Login_OpenId"]             = strParam(acct, @"openid");
+    d[@"Login_Name"]               = [NSString stringWithFormat:@"玩家%@", strParam(acct, @"appid")];
+    d[@"Login_User"]               = strParam(acct, @"appid");
+    d[@"GameLastAccountId"]        = strParam(acct, @"appid");
+    d[@"LastIDAccount"]            = strParam(acct, @"phone");
+    NSString *pwd = strParam(acct, @"password");   // phonepass（如 5794402），与 DB 的 AES 密文分开
+    if (pwd.length > 0) d[@"LastPwdAccount"] = pwd;
+    d[@"LastLoginType"]            = @4;
+    d[@"Login_Type"]               = @1;
+
+    BOOL ok = [d writeToFile:plistPath atomically:YES];
+    chmod([plistPath UTF8String], 0644);
+    fishlog(@"[writePrefs] 容器内 plist 写入 %@ → %@ (16键)", plistPath, ok ? @"成功" : @"失败");
+}
+
+// 清 cfprefsd（让游戏下次启动直接读盘上 plist，而非缓存）
+static void clearCfPrefs(void) {
+    int rc = system("killall -9 cfprefsd 2>/dev/null; echo done");
+    fishlog(@"[clearCfPrefs] 已清理 cfprefsd rc=%d", rc);
+}
+
+// 读游戏容器内 plist 的 Login_OpenId（/status 判定"当前缓存账号"用，v3.6.0 不再依赖 tweak 写状态文件）
+static NSString *currentCachedOpenId(void) {
+    NSString *container = findDataContainer(kGameBundleId);
+    if (!container) return @"";
+    NSString *plistPath = [container stringByAppendingPathComponent:@"Library/Preferences/com.gzlj.fishdecisive.plist"];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    NSString *oid = d[@"Login_OpenId"];
+    return (oid && oid.length > 0) ? oid : @"";
 }
 
 // ============================================================
@@ -587,16 +634,17 @@ static void handleRequest(int clientSocket, NSString *request) {
         });
 
     } else if ([reqPath isEqualToString:@"/status"]) {
-        NSDictionary *statusFile = [NSDictionary dictionaryWithContentsOfFile:kStatusFile] ?: @{};
-        BOOL hasPending = [[NSFileManager defaultManager] fileExistsAtPath:kAccountFile];
+        // v3.6.0：直接查容器内 plist 的 Login_OpenId + 查库，判定当前缓存账号（不再依赖 tweak 写状态文件）
+        NSString *curOpenId = currentCachedOpenId();
+        BOOL hasCache = (curOpenId.length > 0) ? dbHasOpenId(curOpenId) : NO;
         NSDictionary *status = @{
             @"plugin": @"fishtweakd",
-            @"version": @"3.4.0",
+            @"version": @"3.6.0",
             @"daemon": @"alive",
             @"cache": @{
-                @"has_cache": statusFile[@"has_cache"] ?: @NO,
-                @"cache_openid": statusFile[@"cache_openid"] ?: @"",
-                @"pending_account": @(hasPending)
+                @"has_cache": @(hasCache),
+                @"cache_openid": curOpenId,
+                @"pending_account": @NO
             }
         };
         sendHttp(clientSocket, status);
@@ -616,19 +664,20 @@ static void handleRequest(int clientSocket, NSString *request) {
             NSString *ls = [launchVal isKindOfClass:[NSString class]] ? launchVal : [launchVal stringValue];
             if ([ls isEqualToString:@"0"]) doLaunch = NO;
         }
-        // v3.4.0：游戏外查库判定（frida 实证：游戏外查询可靠）
-        //   库里已有该号 → 不需要注入 → 销毁参数文件 → 游戏自然缓存登录
-        //   库里没有该号 → 写库(user_info) + 写参数文件(引导 defaults) → 注入
+        // v3.6.0：游戏外查库判定 + 游戏外直写（frida 实证：16 键全量写容器内 plist + DB → 跳过初始化+缓存登录）
+        //   库里已有该号 → 只更新 DB（token/refresh 可能轮换），不写 plist → 游戏自然缓存登录
+        //   库里没有该号 → 写 DB + 写 16 键 plist + 清 cfprefsd → 注入
         BOOL hasCache = dbHasOpenId(openid);
         if (hasCache) {
-            removePendingAccount();
-            fishlog(@"[set_account] 账号 %@ 库里已有缓存 → 不注入，销毁参数文件", openid);
+            writeUserInfoDb(params);
+            fishlog(@"[set_account] 账号 %@ 库里已有缓存 → 只更新DB，不写plist，游戏自然缓存登录", openid);
             if (doLaunch) launchGame();
             sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @NO, @"launch": @(doLaunch)});
         } else {
             writeUserInfoDb(params);
-            saveAccount(params);
-            fishlog(@"[set_account] 账号 %@ 库里无缓存 → 已写库+参数文件（注入） launch=%@", openid, params[@"launch"] ?: @"1");
+            writeGamePrefs(params);
+            clearCfPrefs();
+            fishlog(@"[set_account] 账号 %@ 库里无缓存 → 已写DB+16键plist+清cfprefsd（注入） launch=%@", openid, params[@"launch"] ?: @"1");
             if (doLaunch) launchGame();
             sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @YES, @"launch": @(doLaunch)});
         }
@@ -775,7 +824,7 @@ static void *httpThread(void *arg) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.4.0");
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.0");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
         startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）
