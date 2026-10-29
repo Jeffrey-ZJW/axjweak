@@ -138,6 +138,8 @@ static void launchGame(void) {
     NSString *exe = findGameBinaryPath();
     fishlog(@"[launchGame] findGameBinaryPath -> %@", exe ?: @"nil");
     BOOL started = NO;
+    // 【测试】强制 posix_spawn + DYLD_INSERT_LIBRARIES（绕过 substitute 注入）
+    if (1) { fishlog(@"[launchGame] FORCE_DYL=1 跳过 SpringBoard 通道，直接 posix_spawn + DYLD_INSERT_LIBRARIES"); goto posixSpawnDirect; }
     @try {
         Class svcClass = NSClassFromString(@"FBSOpenApplicationService");
         Class infoClass = NSClassFromString(@"FBSApplicationInfo");
@@ -258,14 +260,15 @@ static void launchGame(void) {
         return;
     }
 
-    // ---- 兜底：posix_spawn（完整容器环境）----
+posixSpawnDirect:
+    // ---- posix_spawn（完整容器环境 + DYLD_INSERT_LIBRARIES 强制注入）----
     if (!exe) { fishlog(@"[launchGame] 未找到游戏二进制，放弃"); return; }
     NSString *container = findDataContainer(kGameBundleId);
     fishlog(@"[launchGame] data 容器: %@", container ?: @"未找到");
     pid_t pid = 0;
     char *argv[] = {(char *)[exe UTF8String], NULL};
-    char envTmp[1024], envBundle[1024], envHome[1024], envFixed[1024];
-    char *envp[10];
+    char envTmp[1024], envBundle[1024], envHome[1024], envFixed[1024], envDyl[1024];
+    char *envp[11];
     int ei = 0;
     if (container) {
         // iOS app 的 HOME 必须是 data 容器（NSHomeDirectory() 依赖它定位 Documents 缓存库）
@@ -282,6 +285,9 @@ static void launchGame(void) {
         envp[ei++] = (char *)"CFFIXED_USER_HOME=/var/mobile";
     }
     envp[ei++] = (char *)"XPC_SERVICE_NAME=0";
+    // 【强制注入】dyld 启动早期直接加载插件，绕过 substitute 的 plist 匹配
+    snprintf(envDyl, sizeof(envDyl), "DYLD_INSERT_LIBRARIES=/Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib");
+    envp[ei++] = envDyl;
     envp[ei] = NULL;
     int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, argv, envp);
     fishlog(@"[launchGame] posix_spawn rc=%d pid=%d (%s)", rc, (int)pid, rc == 0 ? "OK" : strerror(rc));
