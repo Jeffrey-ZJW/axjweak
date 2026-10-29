@@ -662,6 +662,22 @@ static NSString *shellOutput(NSString *cmd) {
     return out;
 }
 
+// v3.4.0 修复：本地版本直接读 /var/lib/dpkg/status 解析（不依赖 dpkg/grep/awk 管道，iOS launchd 环境管道工具可能缺失）
+static NSString *localInstalledVersion(void) {
+    NSString *status = [NSString stringWithContentsOfFile:@"/var/lib/dpkg/status" encoding:NSUTF8StringEncoding error:NULL];
+    if (!status) return nil;
+    NSRange r = [status rangeOfString:@"Package: com.jeffrey.fishtweak"];
+    if (r.location == NSNotFound) return nil;
+    NSString *seg = [status substringFromIndex:r.location];
+    NSRange v = [seg rangeOfString:@"\nVersion: "];
+    if (v.location == NSNotFound) return nil;
+    NSUInteger start = v.location + v.length;
+    NSRange eol = [seg rangeOfString:@"\n" options:0 range:NSMakeRange(start, MIN(seg.length - start, 64))];
+    if (eol.location == NSNotFound) return nil;
+    return [[seg substringWithRange:NSMakeRange(start, eol.location - start)]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
 static void checkForUpdate(void) {
     @autoreleasepool {
         NSData *data = [NSData dataWithContentsOfURL:[NSURL URLWithString:kUpdateURL]
@@ -673,13 +689,17 @@ static void checkForUpdate(void) {
         }
         [data writeToFile:kUpdateTmp atomically:YES];
         NSString *newVer = [shellOutput([NSString stringWithFormat:@"dpkg-deb -f %@ Version 2>/dev/null", kUpdateTmp]) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        NSString *local = [shellOutput([NSString stringWithFormat:@"dpkg -s %@ 2>/dev/null | grep '^Version:' | awk '{print $2}'", kPackageName]) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *local = localInstalledVersion();
         fishlog(@"[update] 下载 %lu bytes | 新版=%@ | 本地=%@", (unsigned long)data.length, newVer, local);
         if (newVer.length == 0) { fishlog(@"[update] 解析新版版本号失败，跳过"); return; }
         if ([newVer isEqualToString:local]) { fishlog(@"[update] 版本一致(%@)，无需更新", newVer); return; }
-        fishlog(@"[update] ★ 发现新版本 %@ → %@，开始安装", local, newVer);
-        NSString *rc = shellOutput([NSString stringWithFormat:@"dpkg -i %@ 2>&1", kUpdateTmp]);
-        fishlog(@"[update] dpkg -i 输出:\n%@", rc);
+        fishlog(@"[update] ★ 发现新版本 %@ → %@，开始后台安装", local, newVer);
+        // 后台 dpkg 安装（不阻塞 daemon；输出写文件，避免 popen 管道卡住）
+        NSString *cmd = [NSString stringWithFormat:@"dpkg -i %@ >/tmp/fishtweak-dpkg.log 2>&1 &", kUpdateTmp];
+        popen([cmd UTF8String], "r"); // 打开即返回，dpkg 在后台执行
+        pclose(NULL);
+        [NSThread sleepForTimeInterval:3.0]; // 等 dpkg 完成（正常 <2s）
+        fishlog(@"[update] dpkg 后台结果:\n%@", shellOutput(@"cat /tmp/fishtweak-dpkg.log 2>/dev/null; echo ---"));
         // 安装完成：杀游戏（新插件注入需重启进程）；daemon 二进制已被覆盖，kill 自身由 launchd KeepAlive 拉起新版本
         shellOutput(@"killall -9 捕鱼大决战 Fuel5 2>/dev/null; killall -9 fishtweakd 2>/dev/null; echo done");
         fishlog(@"[update] 安装完成，游戏与 daemon 已重启");
