@@ -1,4 +1,4 @@
-﻿FishTweak v3.6.0
+﻿FishTweak v3.6.1
 ================
 捕鱼大决战专用插件（com.gzlj.fishdecisive）
 
@@ -7,50 +7,56 @@
     + 屏蔽按键精灵(DZZ新版)广告
     （v3.6.0 起缓存登录不再走进程内 hook，改为游戏外直写）
   - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / 游戏外直写
-    16键plist+数据库 / 拉起游戏 / 状态查询 / 自动更新
-    + 老功能（发送短信 / 重置密码）迁入
+    16键plist+数据库 / 状态查询 / 自动更新 + 老功能（发送短信 / 重置密码）
 
-【缓存登录新机制 v3.6.0（决定性突破）】
+【缓存登录机制 v3.6.1（决定性突破）】
   按键精灵喂号 → daemon 收号：
     1) 查游戏数据库（<容器>/Documents/AnaestheticsYachtsman/zs_data.sqlite）有无该 openid
        - 有 → 只更新 DB（token/refresh 可能轮换），不写 plist → 游戏自然缓存登录
-       - 没有 → 写 DB + 写【容器内】plist 16 键 + 清 cfprefsd → 拉起/等手动开游戏
-    2) 游戏启动直接读到 16 键 → 跳过初始化界面 + 显示缓存登录（"玩家XXX"+更换账号）
+       - 没有 → 写 DB + 写【容器内】plist 16 键 → 注入完成
+    2) 按键精灵自己拉起游戏（daemon 不再拉起游戏）
+    3) 游戏启动直接读到 16 键 → 跳过初始化界面 + 显示缓存登录（"玩家XXX"+更换账号）
        → 点击缓存账号 → 进服
+  v3.6.1 变化：
+    - 新增 phonepass 参数（明文密码）→ 写 plist 的 LastPwdAccount
+    - password 参数（账号密码hex）→ AES 加密写数据库 user_info.password
+    - 不再自动拉起游戏（按键精灵自己开）
+    - 不再清 cfprefsd（按键精灵每个账号之间自己清）
+    - 删除 /launch 接口
   16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
     基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
     状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
     缓存8：Login_OpenId / Login_Name(玩家+appid) / Login_User / GameLastAccountId
-           / LastIDAccount(手机号) / LastPwdAccount / LastLoginType / Login_Type
+           / LastIDAccount(手机号) / LastPwdAccount(=phonepass明文，可省) / LastLoginType / Login_Type
   注意：
     - plist 必须写【游戏容器内】Library/Preferences/com.gzlj.fishdecisive.plist
       （游戏只读容器内；/var/mobile/Library/Preferences 下的是全局域，游戏不读，已自动删除）
     - KEY_ONLINE_STATE_213 必须和其他键一起全给（单独/部分给会卡加载）
-    - 写完后必须清 cfprefsd（已内置），否则游戏读缓存不到新值
+    - LastPwdAccount 可省（15 键实测也能进服），有 phonepass 就写上更稳
 
 常驻 daemon 接口（127.0.0.1:8888）：
-1. 收号并拉起游戏（缓存登录用）:
-   http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=5794402&launch=1
-   - launch=1 收号后自动拉起游戏；launch=0 只收号不拉起（用户手动开游戏）
+1. 收号（缓存登录用）:
+   http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D
+   - phonepass=明文密码（写 plist LastPwdAccount）
+   - password=账号密码hex（AES 加密写 DB）
    - 返回 injected: true/false 表示本次是否执行了注入（写 plist+DB）
-2. 只拉起游戏:
-   http://127.0.0.1:8888/launch
-3. 查询状态（按键精灵判断有无缓存）:
+   - 收号后不拉起游戏，按键精灵自己开
+2. 查询状态（按键精灵判断有无缓存）:
    http://127.0.0.1:8888/status
    返回: {"cache":{"has_cache":true,"cache_openid":"...","pending_account":false}}
-4. 发送改密码短信（老功能）:
+3. 发送改密码短信（老功能）:
    http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
-5. 重置密码（老功能）:
+4. 重置密码（老功能）:
    http://127.0.0.1:8888/reset_password?mobile=手机号&code=验证码&password=明文密码&uuid=设备UUID
 
-自动更新（v3.4.0 保留，v3.6.0 继续）:
+自动更新（v3.4.0 起保留）:
   - daemon 启动 5 秒后 + 每 6 小时检查一次:
     https://github.com/Jeffrey-ZJW/axjweak/releases/latest/download/fishtweak.deb
   - 版本不同 → 自动 dpkg -i 安装 → 杀游戏与 daemon（launchd 自动拉起新版）
   - 无需手动逐个装包；GitHub 不可达时跳过，下次再查
 
 按键精灵调用示例：
-  Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&password=5794402&launch=1")
+  Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D")
   Url.Get("http://127.0.0.1:8888/status")
 
 老功能（保留）：
@@ -60,5 +66,7 @@
   - 屏蔽按键精灵(DZZ新版)广告：UIView/UIWindow layoutSubviews 命中广告容器隐藏
 
 密码参数说明：
-  - password 参数 = phonepass（如 5794402），写入 plist 的 LastPwdAccount
-  - DB user_info.password = AES-128-ECB+PKCS7 密文（key=Ze1QLUFj296TAho2），daemon 自动加密
+  - phonepass 参数 = 明文密码（如 5794402），直接写入 plist 的 LastPwdAccount（不加密）
+  - password 参数 = 账号密码hex（如 1CE421333A535A1D），daemon AES-128-ECB+PKCS7
+    （key=Ze1QLUFj296TAho2）加密后写数据库 user_info.password
+  - 两个参数各归各位，不要混用

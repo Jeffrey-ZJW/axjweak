@@ -1,11 +1,11 @@
 // ============================================================
-//  fishtweakd —— 常驻 daemon（v3.2）
+//  fishtweakd —— 常驻 daemon（v3.6.1）
 //  职责：仅服务本机游戏《捕鱼大决战》(com.gzlj.fishdecisive)
 //  1) 监听 127.0.0.1:8888（本地回环，只服务按键精灵）
-//  2) /set_account 收号 → 写参数文件 → (可选)自动拉起游戏
-//  3) /launch       拉起游戏
-//  4) /status       返回缓存/待注入状态（读游戏内 tweak 写盘的状态文件）
-//  5) /send_sms /reset_password  老功能（原插件内实现，迁到本进程）
+//  2) /set_account 收号 → 判库 → 无则写DB + 写16键plist（LastPwdAccount=phonepass 明文）
+//  3) /status       返回当前缓存账号状态（直接查容器内 plist + DB）
+//  4) /send_sms /reset_password  老功能（原插件内实现，迁到本进程）
+//  v3.6.1：不拉起游戏（按键精灵自己开）、不清 cfprefsd（按键精灵自己清）、无 /launch 接口
 //  资源：单 accept 线程 + 短连接同步处理，无轮询无后台任务，ARC 无泄漏
 // ============================================================
 #import <Foundation/Foundation.h>
@@ -126,171 +126,6 @@ static NSString *findDataContainer(NSString *bundleId) {
     return nil;
 }
 
-// ============================================================
-//  拉起游戏
-//  首选 FBSOpenApplicationService（SpringBoard 标准拉起通道，带错误回调）；
-//  FBS 失败/超时 → 回退 posix_spawn（带完整容器环境变量，避免黑屏/闪退）
-//  全步骤写文件日志 kLogFile（SSH: cat /var/mobile/Library/Preferences/com.jeffrey.fishtweakd.log）
-// ============================================================
-static void launchGame(void) {
-    fishlog(@"[launchGame] 开始拉起 %@", kGameBundleId);
-    NSString *exe = findGameBinaryPath();
-    fishlog(@"[launchGame] findGameBinaryPath -> %@", exe ?: @"nil");
-    BOOL started = NO;
-    @try {
-        Class svcClass = NSClassFromString(@"FBSOpenApplicationService");
-        Class infoClass = NSClassFromString(@"FBSApplicationInfo");
-        Class handleClass = NSClassFromString(@"FBSProcessHandle");
-        fishlog(@"[launchGame] FBS 类可用: svc=%d info=%d handle=%d", svcClass != nil, infoClass != nil, handleClass != nil);
-        if (svcClass && infoClass && handleClass) {
-            id svc = invoke0(svcClass, @"serviceWithDefaultShellEndpoint");
-            id appInfo = invoke1(infoClass, @"applicationInfoWithBundleIdentifier:", kGameBundleId);
-            id handle = invoke1(handleClass, @"processHandleForApplication:", appInfo);
-            id options = invoke0(NSClassFromString(@"FBSOpenApplicationOptions"), @"optionsWithDefaultValues");
-            fishlog(@"[launchGame] FBS 对象: svc=%d appInfo=%d handle=%d options=%d", svc != nil, appInfo != nil, handle != nil, options != nil);
-            if (svc && appInfo && handle) {
-                SEL sel = NSSelectorFromString(@"openApplication:withOptions:completion:");
-                NSMethodSignature *sig = [svc methodSignatureForSelector:sel];
-                if (sig) {
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    inv.target = svc;
-                    inv.selector = sel;
-                    [inv setArgument:&handle atIndex:2];
-                    [inv setArgument:&options atIndex:3];
-                    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                    __block NSError *fbsErr = nil;
-                    void (^completion)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
-                        fbsErr = error;
-                        fishlog(@"[launchGame] FBS completion: success=%d error=%@", success, error);
-                        dispatch_semaphore_signal(sem);
-                    };
-                    [inv setArgument:&completion atIndex:4];
-                    [inv invoke];
-                    fishlog(@"[launchGame] FBS openApplication 已调用，等待回调(≤3s)...");
-                    long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-                    fishlog(@"[launchGame] FBS 等待结束 r=%ld error=%@", r, fbsErr);
-                    if (r == 0 && !fbsErr) started = YES;
-                } else {
-                    fishlog(@"[launchGame] FBS 无 openApplication:withOptions:completion: 方法");
-                }
-            }
-        } else {
-            fishlog(@"[launchGame] FBS 类不可用，走 posix_spawn");
-        }
-    } @catch (NSException *e) {
-        fishlog(@"[launchGame] FBS 拉起异常: %@", e);
-    }
-    if (started) {
-        fishlog(@"[launchGame] FBS 拉起成功，返回");
-        return;
-    }
-
-    // ---- 通道2：LSApplicationWorkspace（iOS 4+ 通用，LaunchServices 正式拉起通道）----
-    @try {
-        Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
-        if (wsClass) {
-            id ws = invoke0(wsClass, @"defaultWorkspace");
-            if (!ws) ws = [[wsClass alloc] init];
-            SEL sel = NSSelectorFromString(@"openApplicationWithBundleID:");
-            NSMethodSignature *sig = [ws methodSignatureForSelector:sel];
-            if (sig) {
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                inv.target = ws;
-                inv.selector = sel;
-                NSString *bid = kGameBundleId;
-                [inv setArgument:&bid atIndex:2];
-                [inv invoke];
-                BOOL ok = NO;
-                if (sig.methodReturnLength == sizeof(BOOL)) {
-                    [inv getReturnValue:&ok];
-                }
-                fishlog(@"[launchGame] LSApplicationWorkspace openApplicationWithBundleID -> %d", ok);
-                if (ok) started = YES;
-            } else {
-                fishlog(@"[launchGame] LSApplicationWorkspace 无 openApplicationWithBundleID:");
-            }
-        } else {
-            fishlog(@"[launchGame] LSApplicationWorkspace 类不可用");
-        }
-    } @catch (NSException *e) {
-        fishlog(@"[launchGame] LSApplicationWorkspace 异常: %@", e);
-    }
-    if (started) {
-        fishlog(@"[launchGame] LSApplicationWorkspace 拉起成功，返回");
-        return;
-    }
-
-    // ---- 通道3：FBSSystemService（iOS 8-10 专用）----
-    @try {
-        Class fbss = NSClassFromString(@"FBSSystemService");
-        if (fbss) {
-            id sysSvc = [[fbss alloc] init];
-            if (!sysSvc) sysSvc = invoke0(fbss, @"sharedService");
-            SEL sel = NSSelectorFromString(@"openApplication:options:clientPort:withResult:");
-            NSMethodSignature *sig = [sysSvc methodSignatureForSelector:sel];
-            if (sig) {
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                inv.target = sysSvc;
-                inv.selector = sel;
-                NSString *bid = kGameBundleId;
-                [inv setArgument:&bid atIndex:2];
-                NSDictionary *options = @{};
-                [inv setArgument:&options atIndex:3];
-                uint32_t port = MACH_PORT_NULL;
-                [inv setArgument:&port atIndex:4];
-                id resultBlock = nil;
-                [inv setArgument:&resultBlock atIndex:5];
-                [inv invoke];
-                fishlog(@"[launchGame] FBSSystemService openApplication 已调用（假定成功）");
-                started = YES;
-            } else {
-                fishlog(@"[launchGame] FBSSystemService 无 openApplication:options:clientPort:withResult:");
-            }
-        } else {
-            fishlog(@"[launchGame] FBSSystemService 类不可用");
-        }
-    } @catch (NSException *e) {
-        fishlog(@"[launchGame] FBSSystemService 异常: %@", e);
-    }
-    if (started) {
-        fishlog(@"[launchGame] FBSSystemService 通道执行完毕，返回");
-        return;
-    }
-
-    // ---- posix_spawn（完整容器环境；v3.6.0 不再 DYLD 强制注入，游戏外直写已完成缓存制造）----
-    if (!exe) { fishlog(@"[launchGame] 未找到游戏二进制，放弃"); return; }
-    NSString *container = findDataContainer(kGameBundleId);
-    fishlog(@"[launchGame] data 容器: %@", container ?: @"未找到");
-    pid_t pid = 0;
-    char *argv[] = {(char *)[exe UTF8String], NULL};
-    char envTmp[1024], envBundle[1024], envHome[1024], envFixed[1024];
-    char *envp[11];
-    int ei = 0;
-    if (container) {
-        // iOS app 的 HOME 必须是 data 容器（NSHomeDirectory() 依赖它定位 Documents 缓存库）
-        snprintf(envHome, sizeof(envHome), "HOME=%s", [container UTF8String]);
-        snprintf(envFixed, sizeof(envFixed), "CFFIXED_USER_HOME=%s", [container UTF8String]);
-        snprintf(envTmp, sizeof(envTmp), "TMPDIR=%s/tmp", [container UTF8String]);
-        snprintf(envBundle, sizeof(envBundle), "BUNDLE_CONTAINER=%s", [container UTF8String]);
-        envp[ei++] = envHome;
-        envp[ei++] = envFixed;
-        envp[ei++] = envTmp;
-        envp[ei++] = envBundle;
-    } else {
-        envp[ei++] = (char *)"HOME=/var/mobile";
-        envp[ei++] = (char *)"CFFIXED_USER_HOME=/var/mobile";
-    }
-    envp[ei++] = (char *)"XPC_SERVICE_NAME=0";
-    envp[ei] = NULL;
-    int rc = posix_spawn(&pid, [exe UTF8String], NULL, NULL, argv, envp);
-    fishlog(@"[launchGame] posix_spawn rc=%d pid=%d (%s)", rc, (int)pid, rc == 0 ? "OK" : strerror(rc));
-    if (rc == 0) {
-        usleep(1000 * 1000);   // 等 1s 看进程是否存活（缺环境会立即退出）
-        int st = 0;
-        pid_t r2 = waitpid(pid, &st, WNOHANG);
-        fishlog(@"[launchGame] 1s 后 waitpid=%d status=%d (0=进程仍在运行)", (int)r2, st);
-    }
-}
 
 // ============================================================
 //  收号落盘（写参数文件，0644 保证游戏进程 mobile 可读）
@@ -454,8 +289,8 @@ static void writeGamePrefs(NSDictionary *acct) {
     d[@"Login_User"]               = strParam(acct, @"appid");
     d[@"GameLastAccountId"]        = strParam(acct, @"appid");
     d[@"LastIDAccount"]            = strParam(acct, @"phone");
-    NSString *pwd = strParam(acct, @"password");   // phonepass（如 5794402），与 DB 的 AES 密文分开
-    if (pwd.length > 0) d[@"LastPwdAccount"] = pwd;
+    NSString *phonepass = strParam(acct, @"phonepass");   // 明文密码（按键精灵新参数），直接写 LastPwdAccount
+    if (phonepass.length > 0) d[@"LastPwdAccount"] = phonepass;
     d[@"LastLoginType"]            = @4;
     d[@"Login_Type"]               = @1;
 
@@ -464,15 +299,6 @@ static void writeGamePrefs(NSDictionary *acct) {
     fishlog(@"[writePrefs] 容器内 plist 写入 %@ → %@ (16键)", plistPath, ok ? @"成功" : @"失败");
 }
 
-// 清 cfprefsd（让游戏下次启动直接读盘上 plist，而非缓存）
-// iOS SDK 标记 system() 不可用，改用 posix_spawn 执行 /usr/bin/killall
-static void clearCfPrefs(void) {
-    pid_t pid = 0;
-    char *argv[] = {(char *)"/usr/bin/killall", (char *)"-9", (char *)"cfprefsd", NULL};
-    char *envp[] = {(char *)"HOME=/var/mobile", NULL};
-    int rc = posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, argv, envp);
-    fishlog(@"[clearCfPrefs] killall cfprefsd rc=%d pid=%d", rc, (int)pid);
-}
 
 // 读游戏容器内 plist 的 Login_OpenId（/status 判定"当前缓存账号"用，v3.6.0 不再依赖 tweak 写状态文件）
 static NSString *currentCachedOpenId(void) {
@@ -642,7 +468,7 @@ static void handleRequest(int clientSocket, NSString *request) {
         BOOL hasCache = (curOpenId.length > 0) ? dbHasOpenId(curOpenId) : NO;
         NSDictionary *status = @{
             @"plugin": @"fishtweakd",
-            @"version": @"3.6.0",
+            @"version": @"3.6.1",
             @"daemon": @"alive",
             @"cache": @{
                 @"has_cache": @(hasCache),
@@ -658,44 +484,31 @@ static void handleRequest(int clientSocket, NSString *request) {
         if (!openid || openid.length == 0 || !refresh || refresh.length == 0) {
             sendHttp(clientSocket, @{@"error": @"missing openid/refresh",
                                      @"need": @[@"appid", @"openid", @"refresh", @"token",
-                                                @"nickname", @"account", @"phone", @"password", @"launch"]});
+                                                @"nickname", @"account", @"phone", @"phonepass", @"password"]});
             return;
         }
-        BOOL doLaunch = YES;
-        id launchVal = params[@"launch"];
-        if (launchVal) {
-            NSString *ls = [launchVal isKindOfClass:[NSString class]] ? launchVal : [launchVal stringValue];
-            if ([ls isEqualToString:@"0"]) doLaunch = NO;
-        }
-        // v3.6.0：游戏外查库判定 + 游戏外直写（frida 实证：16 键全量写容器内 plist + DB → 跳过初始化+缓存登录）
+        // v3.6.1：游戏外查库判定 + 游戏外直写（frida 实证：16 键全量写容器内 plist + DB → 跳过初始化+缓存登录）
         //   库里已有该号 → 只更新 DB（token/refresh 可能轮换），不写 plist → 游戏自然缓存登录
-        //   库里没有该号 → 写 DB + 写 16 键 plist + 清 cfprefsd → 注入
+        //   库里没有该号 → 写 DB + 写 16 键 plist（LastPwdAccount=phonepass 明文）→ 注入
+        //   v3.6.1：不拉起游戏（按键精灵自己开）、不清 cfprefsd（按键精灵自己清）
         BOOL hasCache = dbHasOpenId(openid);
         if (hasCache) {
             writeUserInfoDb(params);
             fishlog(@"[set_account] 账号 %@ 库里已有缓存 → 只更新DB，不写plist，游戏自然缓存登录", openid);
-            if (doLaunch) launchGame();
-            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @NO, @"launch": @(doLaunch)});
+            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @NO});
         } else {
             writeUserInfoDb(params);
             writeGamePrefs(params);
-            clearCfPrefs();
-            fishlog(@"[set_account] 账号 %@ 库里无缓存 → 已写DB+16键plist+清cfprefsd（注入） launch=%@", openid, params[@"launch"] ?: @"1");
-            if (doLaunch) launchGame();
-            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @YES, @"launch": @(doLaunch)});
+            fishlog(@"[set_account] 账号 %@ 库里无缓存 → 已写DB+16键plist（注入，LastPwd=phonepass）", openid);
+            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @YES});
         }
-
-    } else if ([reqPath isEqualToString:@"/launch"]) {
-        launchGame();
-        sendHttp(clientSocket, @{@"ok": @1, @"launch": @"sent"});
 
     } else {
         sendHttp(clientSocket, @{
             @"endpoints": @[@"/send_sms?mobile=X&uuid=Y",
                             @"/reset_password?mobile=X&code=Y&password=Z&uuid=Y",
                             @"/status",
-                            @"/set_account?appid=X&openid=Y&refresh=Z&token=T&nickname=N&account=A&phone=P&password=M&launch=1",
-                            @"/launch"]
+                            @"/set_account?appid=X&openid=Y&refresh=Z&token=T&nickname=N&account=A&phone=P&phonepass=M&password=H"]
         });
     }
 }
@@ -827,7 +640,7 @@ static void *httpThread(void *arg) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.0");
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.1");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
         startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）
