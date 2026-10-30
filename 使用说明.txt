@@ -1,4 +1,4 @@
-﻿FishTweak v3.6.2
+﻿FishTweak v3.6.3
 ================
 捕鱼大决战专用插件（com.gzlj.fishdecisive）
 
@@ -6,14 +6,17 @@
   - fishtweak（tweak）：注入游戏进程，IDFA伪造 + sys/boot时间伪造 + VPN隐身
     + 屏蔽按键精灵(DZZ新版)广告
     （v3.6.0 起缓存登录不再走进程内 hook，改为游戏外直写）
-  - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / 游戏外直写
-    16键plist+数据库 / 版本号查询 / 自动更新 + 老功能（发送短信 / 重置密码）
+  - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / retoken换token /
+    游戏外直写16键plist+数据库 / 版本号查询 / 自动更新 + 老功能（发送短信 / 重置密码）
 
-【缓存登录机制 v3.6.1（决定性突破）】
+【缓存登录机制 v3.6.3】
   按键精灵喂号 → daemon 收号：
     1) 查游戏数据库（<容器>/Documents/AnaestheticsYachtsman/zs_data.sqlite）有无该 openid
-       - 有 → 只更新 DB（token/refresh 可能轮换），不写 plist → 游戏自然缓存登录
-       - 没有 → 写 DB + 写【容器内】plist 16 键 → 注入完成
+       - 有（有缓存）→ 【完全不动，不更新DB、不写plist】→ 返回 ok
+         ⚠️ 千万别对已有缓存的号再注入：会覆盖游戏里有效的缓存信息导致登录失效
+       - 没有（需要注入）→ 先 retoken 换新 access token：
+         - 换成功 → 用【新 token】写 DB + 写【容器内】plist 16 键 → 注入完成
+         - 换失败（HTTP 400 = refresh 失效 = 封号）→ 不写任何东西 → 返回封号
     2) 按键精灵自己拉起游戏（daemon 不再拉起游戏）
     3) 游戏启动直接读到 16 键 → 跳过初始化界面 + 显示缓存登录（"玩家XXX"+更换账号）
        → 点击缓存账号 → 进服
@@ -25,7 +28,11 @@
     - 删除 /launch 接口
   v3.6.2 变化：
     - /set_account 数据接收成功只返回 ok+saved（不再回 injected/launch）
-    - /status 直接返回插件版本号文本（如 3.6.2），按键精灵比对自动更新用
+    - /status 直接返回插件版本号文本，按键精灵比对自动更新用
+  v3.6.3 变化：
+    - 有缓存 → 完全不动（连 DB 也不更新），直接返回 ok，防止覆盖有效缓存
+    - 需要注入 → 先 retoken（refresh token 换新 access token）→ 新 token 写 DB + 16键plist
+    - retoken 失败(HTTP 400=封号) → 返回 {"ok":0,"saved":"...","ban":true}，不写任何东西
   16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
     基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
     状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
@@ -42,15 +49,25 @@
    http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D
    - phonepass=明文密码（写 plist LastPwdAccount）
    - password=账号密码hex（AES 加密写 DB）
-   - 返回: {"ok":1,"saved":"<openid>"} —— 只要返回 ok 就是数据接收成功
+   - 返回:
+     成功: {"ok":1,"saved":"<openid>","ban":false}
+     封号: {"ok":0,"saved":"<openid>","ban":true,"err":"banned"}   ← refresh 失效=封号，冻结该账号
+     网络: {"ok":0,"saved":"<openid>","ban":false,"err":"network"} ← 可重试，不误冻结
    - 收号后不拉起游戏，按键精灵自己开
 2. 查询插件版本（自动更新比对用）:
    http://127.0.0.1:8888/status
-   返回: 3.6.2（纯文本，直接和版本号变量比较）
+   返回: 3.6.3（纯文本，直接和版本号变量比较）
 3. 发送改密码短信（老功能）:
    http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
 4. 重置密码（老功能）:
    http://127.0.0.1:8888/reset_password?mobile=手机号&code=验证码&password=明文密码&uuid=设备UUID
+
+retoken（自动换 token）说明：
+  - 端点: POST https://oauth2.buyuios.com/connect/token?api-version=1
+  - body: grant_type=refresh_token&refresh_token=<喂号的refresh>
+  - Header: Authorization: Basic base64(10019HuimLoR2WYDXib2W9Y8Rk0vHqg5:Ze1QLUFj296TAho2Wic6ON3pOerrzQo1)
+  - HTTP 200 → 新 access_token 写 DB（避免用旧 token 注入导致登录失效）
+  - HTTP 400 invalid_grant → refresh 也失效 = 账号被封 → 返回 ban:true
 
 自动更新（v3.4.0 起保留，v3.6.2 验证通过）:
   - daemon 启动 5 秒后 + 每 6 小时检查一次:
@@ -62,10 +79,27 @@
   喂号：Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D")
   查版本：Url.Get("http://127.0.0.1:8888/status")
 
+【按键精灵收号代码（正确写法，勿把请求配置当响应）】
+  Function 缓存注入()
+    Do
+        Dim data = {"appid":当前账号, "openid":openid, "phone":手机号, "phonepass":密码, "password":password, "nickname":昵称, "refresh":refreshtoken, "token":token}
+        Dim date1 = {"url":"http://127.0.0.1:8888/set_account","data":Cjson.Encode(data),"header":{"Content-Type":"application/json"}}
+        Dim resp = Url.HttpPost(date1)      ' ← 真实响应：{"saved":"...","ok":1,"ban":false}
+        TracePrint "响应: " & resp
+        Dim rj = Cjson.Decode(resp)
+        If rj["ok"] = 1 Then Exit Do       ' ok 是数字 1
+        If rj["ban"] = true Then
+            TracePrint "该账号已封号，冻结处理"
+            Exit Function                   ' 或跳冻结流程
+        End If
+        Delay 1000
+    Loop
+  End Function
+
 【按键精灵自动更新代码（等插件升到期望版本）】
   用途：插件没到你要的版本时，自动 killall 让 daemon 重启检查更新，循环直到版本到位。
-  ' 版本号变量：手动填写你期望的版本（如 3.6.2）
-  Dim 期望版本 = "3.6.2"
+  ' 版本号变量：手动填写你期望的版本（如 3.6.3）
+  Dim 期望版本 = "3.6.3"
   Do
     Dim 当前版本 = URL.Get("http://127.0.0.1:8888/status")
     TracePrint "当前插件版本: " & 当前版本
@@ -74,7 +108,7 @@
       Exit Do
     End If
     zm.Execute "killall fishtweakd"   ' daemon 被杀后 launchd 自动拉起 → 启动5秒后检查更新
-    Delay 8000
+    Delay 60000
   Loop
 
 密码参数说明：

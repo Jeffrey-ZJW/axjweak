@@ -1,12 +1,13 @@
 // ============================================================
-//  fishtweakd —— 常驻 daemon（v3.6.2）
+//  fishtweakd —— 常驻 daemon（v3.6.3）
 //  职责：仅服务本机游戏《捕鱼大决战》(com.gzlj.fishdecisive)
 //  1) 监听 127.0.0.1:8888（本地回环，只服务按键精灵）
-//  2) /set_account 收号 → 判库 → 无则写DB + 写16键plist（LastPwdAccount=phonepass 明文）
+//  2) /set_account 收号 → 判库 → 有缓存完全不动；需注入则先 retoken 换新 token → 写DB + 写16键plist
 //  3) /status       直接返回版本号（按键精灵比对自动更新是否到位）
 //  4) /send_sms /reset_password  老功能（原插件内实现，迁到本进程）
 //  v3.6.1：不拉起游戏（按键精灵自己开）、不清 cfprefsd（按键精灵自己清）、无 /launch 接口
 //  v3.6.2：/set_account 成功仅返回 ok+saved；/status 返回纯版本号文本
+//  v3.6.3：有缓存完全不动（连DB也不更新）；需注入先 retoken 换新 token；换不到=封号 → ban:true
 //  资源：单 accept 线程 + 短连接同步处理，无轮询无后台任务，ARC 无泄漏
 // ============================================================
 #import <Foundation/Foundation.h>
@@ -328,6 +329,63 @@ static void sendGameRequest(NSString *path, NSDictionary *bodyDict, void (^callb
     [task resume];
 }
 
+// ============================================================
+//  v3.6.3 新增：retoken（用 refresh token 换新 access token）
+//  用途：/set_account 判定"需要注入"时先换新鲜 token 写 DB，避免登录失效
+//  成功 → @{@"ok":@YES, @"token":@"<新access_token>"}
+//  明确封号(HTTP 400 invalid_grant, refresh 也失效) → @{@"ok":@NO, @"ban":@YES, @"err":@"banned"}
+//  网络错误/超时(20s) → @{@"ok":@NO, @"ban":@NO, @"err":@"network"}  （按键精灵可重试，不误冻结）
+// ============================================================
+static NSDictionary *retoken(NSString *refreshToken) {
+    NSString *client = @"10019HuimLoR2WYDXib2W9Y8Rk0vHqg5";
+    NSString *secret = @"Ze1QLUFj296TAho2Wic6ON3pOerrzQo1";
+    NSString *auth = [NSString stringWithFormat:@"%@:%@", client, secret];
+    NSData *authData = [auth dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *b64 = [authData base64EncodedStringWithOptions:0];
+
+    NSURL *url = [NSURL URLWithString:@"https://oauth2.buyuios.com/connect/token?api-version=1"];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    [req setHTTPMethod:@"POST"];
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:[NSString stringWithFormat:@"Basic %@", b64] forHTTPHeaderField:@"Authorization"];
+    NSString *esc = [refreshToken stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    NSString *body = [NSString stringWithFormat:@"grant_type=refresh_token&refresh_token=%@", esc];
+    [req setHTTPBody:[body dataUsingEncoding:NSUTF8StringEncoding]];
+
+    __block NSMutableDictionary *result = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) {
+            fishlog(@"[retoken] 网络错误: %@", error.localizedDescription);
+            result = [@{@"ok": @NO, @"ban": @NO, @"err": @"network"} mutableCopy];
+        } else {
+            NSHTTPURLResponse *hr = (NSHTTPURLResponse *)response;
+            if (hr.statusCode == 200 && data.length > 0) {
+                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if ([json isKindOfClass:[NSDictionary class]] && [json[@"access_token"] isKindOfClass:[NSString class]]) {
+                    result = [@{@"ok": @YES, @"token": json[@"access_token"]} mutableCopy];
+                } else {
+                    fishlog(@"[retoken] 200 但无 access_token");
+                    result = [@{@"ok": @NO, @"ban": @NO, @"err": @"badresp"} mutableCopy];
+                }
+            } else {
+                // 400 invalid_grant = refresh token 失效 = 账号被封
+                fishlog(@"[retoken] 刷新失败 HTTP=%ld（refresh 失效=封号）", (long)hr.statusCode);
+                result = [@{@"ok": @NO, @"ban": @YES, @"err": @"banned"} mutableCopy];
+            }
+        }
+        dispatch_semaphore_signal(sem);
+    }];
+    [task resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+    if (!result) {
+        fishlog(@"[retoken] 20s 超时，按网络错误处理");
+        result = [@{@"ok": @NO, @"ban": @NO, @"err": @"timeout"} mutableCopy];
+    }
+    return result;
+}
+
 static void sendHttp(int clientSocket, NSDictionary *json) {
     NSData *body = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
     NSString *response = [NSString stringWithFormat:
@@ -410,8 +468,8 @@ static void handleRequest(int clientSocket, NSString *request) {
         });
 
     } else if ([reqPath isEqualToString:@"/status"]) {
-        // v3.6.2：直接返回插件版本号（按键精灵比对用），不再返回 cache JSON
-        sendHttpText(clientSocket, @"3.6.2");
+        // v3.6.3：直接返回插件版本号（按键精灵比对用），不再返回 cache JSON
+        sendHttpText(clientSocket, @"3.6.3");
 
     } else if ([reqPath isEqualToString:@"/set_account"]) {
         NSString *openid = params[@"openid"];
@@ -423,20 +481,28 @@ static void handleRequest(int clientSocket, NSString *request) {
             return;
         }
         // v3.6.1：游戏外查库判定 + 游戏外直写（frida 实证：16 键全量写容器内 plist + DB → 跳过初始化+缓存登录）
-        //   库里已有该号 → 只更新 DB（token/refresh 可能轮换），不写 plist → 游戏自然缓存登录
-        //   库里没有该号 → 写 DB + 写 16 键 plist（LastPwdAccount=phonepass 明文）→ 注入
         //   v3.6.1：不拉起游戏（按键精灵自己开）、不清 cfprefsd（按键精灵自己清）
         // v3.6.2：数据接收成功即返回 ok，不再回 injected/launch
+        // v3.6.3：已有缓存 → 完全不动（连 DB 也不更新）直接 ok；
+        //         需要注入 → 先 retoken 换新 token 写 DB + 16键plist；换不到(封号) → 返回 ban:true，不写任何东西
         BOOL hasCache = dbHasOpenId(openid);
         if (hasCache) {
-            writeUserInfoDb(params);
-            fishlog(@"[set_account] 账号 %@ 库里已有缓存 → 只更新DB，不写plist，游戏自然缓存登录", openid);
-            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid});
+            fishlog(@"[set_account] 账号 %@ 已有缓存，无需任何操作（不更新DB/plist）", openid);
+            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"ban": @NO});
         } else {
-            writeUserInfoDb(params);
-            writeGamePrefs(params);
-            fishlog(@"[set_account] 账号 %@ 库里无缓存 → 已写DB+16键plist（注入，LastPwd=phonepass）", openid);
-            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid});
+            NSDictionary *rt = retoken(refresh);
+            if ([rt[@"ok"] boolValue]) {
+                NSMutableDictionary *p2 = [params mutableCopy];
+                p2[@"token"] = rt[@"token"];   // 用 retoken 换到的新 access_token 写 DB（避免登录失效）
+                writeUserInfoDb(p2);
+                writeGamePrefs(p2);
+                fishlog(@"[set_account] 账号 %@ 注入完成（retoken 已换新token写DB + 16键plist，LastPwd=phonepass）", openid);
+                sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"ban": @NO});
+            } else {
+                // retoken 失败：400=真封号(ban:true)；网络/超时=可重试(ban:false)，都不写 DB/plist
+                fishlog(@"[set_account] 账号 %@ retoken 失败 err=%@ ban=%d → 不写DB不写plist", openid, rt[@"err"], [rt[@"ban"] boolValue]);
+                sendHttp(clientSocket, @{@"ok": @0, @"saved": openid, @"ban": rt[@"ban"], @"err": rt[@"err"]});
+            }
         }
 
     } else {
@@ -576,7 +642,7 @@ static void *httpThread(void *arg) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.2");
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.3");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
         startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）
