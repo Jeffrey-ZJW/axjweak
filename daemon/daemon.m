@@ -58,59 +58,6 @@ static NSString *const kKeyHex = @"5a6531514c55466a3239365441686f32576963364f4e3
 static NSString *const kIvHex  = @"5a6531514c55466a3239365441686f32";
 
 // ============================================================
-//  定位游戏主程序（只匹配本游戏 bundle id）
-// ============================================================
-static NSString *findGameBinaryPath(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *top = [fm contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:NULL];
-    for (NSString *d in top) {
-        NSString *appRoot = [@"/var/containers/Bundle/Application" stringByAppendingPathComponent:d];
-        NSArray *items = [fm contentsOfDirectoryAtPath:appRoot error:NULL];
-        for (NSString *it in items) {
-            if (![it hasSuffix:@".app"]) continue;
-            NSString *appDir = [appRoot stringByAppendingPathComponent:it];
-            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                                  [appDir stringByAppendingPathComponent:@"Info.plist"]];
-            if ([info[@"CFBundleIdentifier"] isEqualToString:kGameBundleId]) {
-                NSString *exec = info[@"CFBundleExecutable"];
-                if (!exec || exec.length == 0) exec = @"Fuel5";
-                return [appDir stringByAppendingPathComponent:exec];
-            }
-        }
-    }
-    return nil;
-}
-
-// ============================================================
-//  私有 API 动态调用辅助（NSInvocation，避免 ARC performSelector 警告）
-// ============================================================
-static id invoke0(id target, NSString *selName) {
-    SEL sel = NSSelectorFromString(selName);
-    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
-    if (!sig) return nil;
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    inv.target = target;
-    inv.selector = sel;
-    [inv invoke];
-    __unsafe_unretained id ret = nil;
-    if (sig.methodReturnLength > 0) [inv getReturnValue:&ret];
-    return ret;
-}
-static id invoke1(id target, NSString *selName, id arg) {
-    SEL sel = NSSelectorFromString(selName);
-    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
-    if (!sig) return nil;
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    inv.target = target;
-    inv.selector = sel;
-    [inv setArgument:&arg atIndex:2];
-    [inv invoke];
-    __unsafe_unretained id ret = nil;
-    if (sig.methodReturnLength > 0) [inv getReturnValue:&ret];
-    return ret;
-}
-
-// ============================================================
 //  定位游戏数据容器（/var/mobile/Containers/Data/Application/<uuid>）
 //  通过 .com.apple.mobile_container_manager.metadata.plist 匹配 bundle id
 // ============================================================
