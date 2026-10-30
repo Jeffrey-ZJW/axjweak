@@ -382,8 +382,8 @@ static void hideDZZAdIfMatch(UIView *v) {
 // v3.6.0：缓存登录检查移除（daemon 游戏外直写 16 键 plist + DB 已完成，无需进程内兜底）
 
 %ctor {
-    tlog(@"★ 插件已加载 v3.6.1，进程=%@", [[NSProcessInfo processInfo] processName]);
-    NSLog(@"[FishTweak] 插件已加载 v3.6.1");
+    tlog(@"★ 插件已加载 v3.6.2，进程=%@", [[NSProcessInfo processInfo] processName]);
+    NSLog(@"[FishTweak] 插件已加载 v3.6.2");
     if (!isGameProcess()) {
         // 非游戏进程（如按键精灵）：仅广告屏蔽等通用 hook 生效，跳过游戏专属逻辑
         tlog(@"非游戏进程(%@)，跳过 sys/boot/VPN 逻辑", [[NSProcessInfo processInfo] processName]);

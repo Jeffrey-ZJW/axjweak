@@ -1,11 +1,12 @@
 // ============================================================
-//  fishtweakd —— 常驻 daemon（v3.6.1）
+//  fishtweakd —— 常驻 daemon（v3.6.2）
 //  职责：仅服务本机游戏《捕鱼大决战》(com.gzlj.fishdecisive)
 //  1) 监听 127.0.0.1:8888（本地回环，只服务按键精灵）
 //  2) /set_account 收号 → 判库 → 无则写DB + 写16键plist（LastPwdAccount=phonepass 明文）
-//  3) /status       返回当前缓存账号状态（直接查容器内 plist + DB）
+//  3) /status       直接返回版本号（按键精灵比对自动更新是否到位）
 //  4) /send_sms /reset_password  老功能（原插件内实现，迁到本进程）
 //  v3.6.1：不拉起游戏（按键精灵自己开）、不清 cfprefsd（按键精灵自己清）、无 /launch 接口
+//  v3.6.2：/set_account 成功仅返回 ok+saved；/status 返回纯版本号文本
 //  资源：单 accept 线程 + 短连接同步处理，无轮询无后台任务，ARC 无泄漏
 // ============================================================
 #import <Foundation/Foundation.h>
@@ -247,16 +248,6 @@ static void writeGamePrefs(NSDictionary *acct) {
 }
 
 
-// 读游戏容器内 plist 的 Login_OpenId（/status 判定"当前缓存账号"用，v3.6.0 不再依赖 tweak 写状态文件）
-static NSString *currentCachedOpenId(void) {
-    NSString *container = findDataContainer(kGameBundleId);
-    if (!container) return @"";
-    NSString *plistPath = [container stringByAppendingPathComponent:@"Library/Preferences/com.gzlj.fishdecisive.plist"];
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:plistPath];
-    NSString *oid = d[@"Login_OpenId"];
-    return (oid && oid.length > 0) ? oid : @"";
-}
-
 // ============================================================
 //  本地 HTTP 服务（原插件实现迁入，短连接同步处理）
 // ============================================================
@@ -347,6 +338,15 @@ static void sendHttp(int clientSocket, NSDictionary *json) {
     close(clientSocket);
 }
 
+// v3.6.2：纯文本响应（/status 返回版本号，按键精灵直接比对）
+static void sendHttpText(int clientSocket, NSString *text) {
+    NSString *response = [NSString stringWithFormat:
+        @"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n%@",
+        (unsigned long)[text lengthOfBytesUsingEncoding:NSUTF8StringEncoding], text];
+    send(clientSocket, response.UTF8String, strlen(response.UTF8String), 0);
+    close(clientSocket);
+}
+
 static void handleRequest(int clientSocket, NSString *request) {
     NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
     if (lines.count == 0) return;
@@ -410,20 +410,8 @@ static void handleRequest(int clientSocket, NSString *request) {
         });
 
     } else if ([reqPath isEqualToString:@"/status"]) {
-        // v3.6.0：直接查容器内 plist 的 Login_OpenId + 查库，判定当前缓存账号（不再依赖 tweak 写状态文件）
-        NSString *curOpenId = currentCachedOpenId();
-        BOOL hasCache = (curOpenId.length > 0) ? dbHasOpenId(curOpenId) : NO;
-        NSDictionary *status = @{
-            @"plugin": @"fishtweakd",
-            @"version": @"3.6.1",
-            @"daemon": @"alive",
-            @"cache": @{
-                @"has_cache": @(hasCache),
-                @"cache_openid": curOpenId,
-                @"pending_account": @NO
-            }
-        };
-        sendHttp(clientSocket, status);
+        // v3.6.2：直接返回插件版本号（按键精灵比对用），不再返回 cache JSON
+        sendHttpText(clientSocket, @"3.6.2");
 
     } else if ([reqPath isEqualToString:@"/set_account"]) {
         NSString *openid = params[@"openid"];
@@ -438,16 +426,17 @@ static void handleRequest(int clientSocket, NSString *request) {
         //   库里已有该号 → 只更新 DB（token/refresh 可能轮换），不写 plist → 游戏自然缓存登录
         //   库里没有该号 → 写 DB + 写 16 键 plist（LastPwdAccount=phonepass 明文）→ 注入
         //   v3.6.1：不拉起游戏（按键精灵自己开）、不清 cfprefsd（按键精灵自己清）
+        // v3.6.2：数据接收成功即返回 ok，不再回 injected/launch
         BOOL hasCache = dbHasOpenId(openid);
         if (hasCache) {
             writeUserInfoDb(params);
             fishlog(@"[set_account] 账号 %@ 库里已有缓存 → 只更新DB，不写plist，游戏自然缓存登录", openid);
-            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @NO});
+            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid});
         } else {
             writeUserInfoDb(params);
             writeGamePrefs(params);
             fishlog(@"[set_account] 账号 %@ 库里无缓存 → 已写DB+16键plist（注入，LastPwd=phonepass）", openid);
-            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"injected": @YES});
+            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid});
         }
 
     } else {
@@ -587,7 +576,7 @@ static void *httpThread(void *arg) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.1");
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.2");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
         startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）

@@ -1,4 +1,4 @@
-﻿FishTweak v3.6.1
+﻿FishTweak v3.6.2
 ================
 捕鱼大决战专用插件（com.gzlj.fishdecisive）
 
@@ -7,7 +7,7 @@
     + 屏蔽按键精灵(DZZ新版)广告
     （v3.6.0 起缓存登录不再走进程内 hook，改为游戏外直写）
   - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / 游戏外直写
-    16键plist+数据库 / 状态查询 / 自动更新 + 老功能（发送短信 / 重置密码）
+    16键plist+数据库 / 版本号查询 / 自动更新 + 老功能（发送短信 / 重置密码）
 
 【缓存登录机制 v3.6.1（决定性突破）】
   按键精灵喂号 → daemon 收号：
@@ -23,6 +23,9 @@
     - 不再自动拉起游戏（按键精灵自己开）
     - 不再清 cfprefsd（按键精灵每个账号之间自己清）
     - 删除 /launch 接口
+  v3.6.2 变化：
+    - /set_account 数据接收成功只返回 ok+saved（不再回 injected/launch）
+    - /status 直接返回插件版本号文本（如 3.6.2），按键精灵比对自动更新用
   16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
     基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
     状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
@@ -39,31 +42,40 @@
    http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D
    - phonepass=明文密码（写 plist LastPwdAccount）
    - password=账号密码hex（AES 加密写 DB）
-   - 返回 injected: true/false 表示本次是否执行了注入（写 plist+DB）
+   - 返回: {"ok":1,"saved":"<openid>"} —— 只要返回 ok 就是数据接收成功
    - 收号后不拉起游戏，按键精灵自己开
-2. 查询状态（按键精灵判断有无缓存）:
+2. 查询插件版本（自动更新比对用）:
    http://127.0.0.1:8888/status
-   返回: {"cache":{"has_cache":true,"cache_openid":"...","pending_account":false}}
+   返回: 3.6.2（纯文本，直接和版本号变量比较）
 3. 发送改密码短信（老功能）:
    http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
 4. 重置密码（老功能）:
    http://127.0.0.1:8888/reset_password?mobile=手机号&code=验证码&password=明文密码&uuid=设备UUID
 
-自动更新（v3.4.0 起保留）:
+自动更新（v3.4.0 起保留，v3.6.2 验证通过）:
   - daemon 启动 5 秒后 + 每 6 小时检查一次:
     https://github.com/Jeffrey-ZJW/axjweak/releases/latest/download/fishtweak.deb
   - 版本不同 → 自动 dpkg -i 安装 → 杀游戏与 daemon（launchd 自动拉起新版）
   - 无需手动逐个装包；GitHub 不可达时跳过，下次再查
 
 按键精灵调用示例：
-  Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D")
-  Url.Get("http://127.0.0.1:8888/status")
+  喂号：Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D")
+  查版本：Url.Get("http://127.0.0.1:8888/status")
 
-老功能（保留）：
-  - IDFA 伪造：LSApplicationWorkspace/ASIdentifierManager advertisingIdentifier 拦截
-  - sys/boot 时间伪造：sysctl kern.boottime + MCMeta.plist stat 时间
-  - VPN 隐身：getifaddrs/if_nametoindex/if_nameindex/if_indextoname 摘除 utun/ipsec/ppp 接口
-  - 屏蔽按键精灵(DZZ新版)广告：UIView/UIWindow layoutSubviews 命中广告容器隐藏
+【按键精灵自动更新代码（等插件升到期望版本）】
+  用途：插件没到你要的版本时，自动 killall 让 daemon 重启检查更新，循环直到版本到位。
+  ' 版本号变量：手动填写你期望的版本（如 3.6.2）
+  Dim 期望版本 = "3.6.2"
+  Do
+    Dim 当前版本 = URL.Get("http://127.0.0.1:8888/status")
+    TracePrint "当前插件版本: " & 当前版本
+    If 当前版本 = 期望版本 Then
+      TracePrint "插件版本已到位: " & 当前版本
+      Exit Do
+    End If
+    zm.Execute "killall fishtweakd"   ' daemon 被杀后 launchd 自动拉起 → 启动5秒后检查更新
+    Delay 8000
+  Loop
 
 密码参数说明：
   - phonepass 参数 = 明文密码（如 5794402），直接写入 plist 的 LastPwdAccount（不加密）
