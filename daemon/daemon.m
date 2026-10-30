@@ -257,7 +257,6 @@ static void launchGame(void) {
         return;
     }
 
-posixSpawnDirect:
     // ---- posix_spawn（完整容器环境；v3.6.0 不再 DYLD 强制注入，游戏外直写已完成缓存制造）----
     if (!exe) { fishlog(@"[launchGame] 未找到游戏二进制，放弃"); return; }
     NSString *container = findDataContainer(kGameBundleId);
@@ -466,9 +465,13 @@ static void writeGamePrefs(NSDictionary *acct) {
 }
 
 // 清 cfprefsd（让游戏下次启动直接读盘上 plist，而非缓存）
+// iOS SDK 标记 system() 不可用，改用 posix_spawn 执行 /usr/bin/killall
 static void clearCfPrefs(void) {
-    int rc = system("killall -9 cfprefsd 2>/dev/null; echo done");
-    fishlog(@"[clearCfPrefs] 已清理 cfprefsd rc=%d", rc);
+    pid_t pid = 0;
+    char *argv[] = {(char *)"/usr/bin/killall", (char *)"-9", (char *)"cfprefsd", NULL};
+    char *envp[] = {(char *)"HOME=/var/mobile", NULL};
+    int rc = posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, argv, envp);
+    fishlog(@"[clearCfPrefs] killall cfprefsd rc=%d pid=%d", rc, (int)pid);
 }
 
 // 读游戏容器内 plist 的 Login_OpenId（/status 判定"当前缓存账号"用，v3.6.0 不再依赖 tweak 写状态文件）
