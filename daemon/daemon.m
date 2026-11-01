@@ -1,5 +1,5 @@
 // ============================================================
-//  fishtweakd —— 常驻 daemon（v3.6.3）
+//  fishtweakd —— 常驻 daemon（v3.6.4）
 //  职责：仅服务本机游戏《捕鱼大决战》(com.gzlj.fishdecisive)
 //  1) 监听 127.0.0.1:8888（本地回环，只服务按键精灵）
 //  2) /set_account 收号 → 判库 → 有缓存完全不动；需注入则先 retoken 换新 token → 写DB + 写16键plist
@@ -8,11 +8,14 @@
 //  v3.6.1：不拉起游戏（按键精灵自己开）、不清 cfprefsd（按键精灵自己清）、无 /launch 接口
 //  v3.6.2：/set_account 成功仅返回 ok+saved；/status 返回纯版本号文本
 //  v3.6.3：有缓存完全不动（连DB也不更新）；需注入先 retoken 换新 token；换不到=封号 → ban:true
-//  资源：单 accept 线程 + 短连接同步处理，无轮询无后台任务，ARC 无泄漏
+//  v3.6.4：防卡死——每连接独立线程处理（retoken 卡20s只影响自己）+ recv 5s超时 + sqlite busy 3s
+//  资源：单 accept 线程 + 每连接短线程，无轮询无后台任务，ARC 无泄漏
 // ============================================================
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <stdint.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -116,6 +119,8 @@ static BOOL dbHasOpenId(NSString *openId) {
         if (db) sqlite3_close(db);
         return NO;
     }
+    // v3.6.4：游戏运行时可能持有 DB 锁，busy 3 秒即放弃，不让读库无限阻塞 HTTP 服务
+    sqlite3_busy_timeout(db, 3000);
     BOOL found = NO;
     sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT COUNT(*) FROM user_info WHERE openId=?;";
@@ -160,6 +165,8 @@ static void writeUserInfoDb(NSDictionary *acct) {
         if (db) sqlite3_close(db);
         return;
     }
+    // v3.6.4：游戏运行时可能持有 DB 锁，busy 3 秒即放弃，不让写库无限阻塞 HTTP 服务
+    sqlite3_busy_timeout(db, 3000);
     const char *createSql = "CREATE TABLE IF NOT EXISTS user_info(openId varchar(100) PRIMARY KEY NOT NULL,token TEXT NOT NULL,refreshToken TEXT NOT NULL,tokenType int NOT NULL,mobile varchar(50),nickName varchar(100),loginTime INTEGER NOT NULL,account varchar(100),password varchar(100),expires_in INTEGER NOT NULL,thirdUserId TEXT);";
     sqlite3_exec(db, createSql, NULL, NULL, NULL);
     // nickname 含特殊字符时转义单引号（其余字段为 Base64/数字/md5，无单引号）
@@ -468,8 +475,8 @@ static void handleRequest(int clientSocket, NSString *request) {
         });
 
     } else if ([reqPath isEqualToString:@"/status"]) {
-        // v3.6.3：直接返回插件版本号（按键精灵比对用），不再返回 cache JSON
-        sendHttpText(clientSocket, @"3.6.3");
+        // v3.6.4：直接返回插件版本号（按键精灵比对用），不再返回 cache JSON
+        sendHttpText(clientSocket, @"3.6.4");
 
     } else if ([reqPath isEqualToString:@"/set_account"]) {
         NSString *openid = params[@"openid"];
@@ -591,6 +598,46 @@ static void startUpdateLoop(void) {
     });
 }
 
+// v3.6.4：单连接处理（独立线程）。recv 5s 超时：半开连接/body 没发完的客户端自动断开，
+// 不会像旧版（单线程同步 recv 无超时）那样永久卡死整个 8888 服务
+static void *handleConnection(void *arg) {
+    int client = (int)(intptr_t)arg;
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buffer[16384];
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(buffer) - 1) {
+        ssize_t n = recv(client, buffer + total, sizeof(buffer) - 1 - total, 0);
+        if (n <= 0) break; // 超时/关闭/出错都断开
+        total += n;
+        buffer[total] = '\0';
+        // 判断 header 是否完整，再按 Content-Length 等 body
+        NSString *soFar = [NSString stringWithUTF8String:buffer];
+        NSRange hdrEnd = [soFar rangeOfString:@"\r\n\r\n"];
+        if (hdrEnd.location == NSNotFound) continue;
+        NSInteger contentLength = 0;
+        NSArray *hdrLines = [[soFar substringToIndex:hdrEnd.location] componentsSeparatedByString:@"\r\n"];
+        for (NSString *hl in hdrLines) {
+            if ([[hl lowercaseString] hasPrefix:@"content-length:"]) {
+                contentLength = [[hl substringFromIndex:15] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]].integerValue;
+                break;
+            }
+        }
+        if (total >= (ssize_t)(hdrEnd.location + 4 + contentLength)) break;
+    }
+    if (total > 0) {
+        buffer[total] = '\0';
+        NSString *request = [NSString stringWithUTF8String:buffer];
+        @autoreleasepool {
+            handleRequest(client, request);
+        }
+    }
+    close(client);
+    return NULL;
+}
+
 static void *httpThread(void *arg) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     int yes = 1;
@@ -604,45 +651,24 @@ static void *httpThread(void *arg) {
         NSLog(@"[FishTweakD] bind 8888 失败: %s", strerror(errno));
         return NULL;
     }
-    listen(s, 10);
+    listen(s, 64);
     NSLog(@"[FishTweakD] 监听 127.0.0.1:%d 就绪", kLocalPort);
     while (1) {
         int client = accept(s, NULL, NULL);
-        if (client < 0) break;
-        char buffer[16384];
-        ssize_t total = 0;
-        while (total < (ssize_t)sizeof(buffer) - 1) {
-            ssize_t n = recv(client, buffer + total, sizeof(buffer) - 1 - total, 0);
-            if (n <= 0) break;
-            total += n;
-            buffer[total] = '\0';
-            // 判断 header 是否完整，再按 Content-Length 等 body
-            NSString *soFar = [NSString stringWithUTF8String:buffer];
-            NSRange hdrEnd = [soFar rangeOfString:@"\r\n\r\n"];
-            if (hdrEnd.location == NSNotFound) continue;
-            NSInteger contentLength = 0;
-            NSArray *hdrLines = [[soFar substringToIndex:hdrEnd.location] componentsSeparatedByString:@"\r\n"];
-            for (NSString *hl in hdrLines) {
-                if ([[hl lowercaseString] hasPrefix:@"content-length:"]) {
-                    contentLength = [[hl substringFromIndex:15] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]].integerValue;
-                    break;
-                }
-            }
-            if (total >= (ssize_t)(hdrEnd.location + 4 + contentLength)) break;
-        }
-        if (total > 0) {
-            buffer[total] = '\0';
-            NSString *request = [NSString stringWithUTF8String:buffer];
-            handleRequest(client, request);
-        }
-        close(client);
+        if (client < 0) { usleep(100000); continue; } // 瞬态错误不退出，继续接单
+        // v3.6.4：每连接一个独立线程处理，accept 循环永不阻塞。
+        //   之前单线程同步处理：retoken 卡 20s / 慢客户端卡 recv 会把整个服务堵死，
+        //   按键精灵 HttpPost 超时返回空 = "插件失效"，只能重装恢复（launchd 不管卡死进程）
+        pthread_t th;
+        pthread_create(&th, NULL, handleConnection, (void *)(intptr_t)client);
+        pthread_detach(th);
     }
     return NULL;
 }
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.3");
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.4");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
         startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）

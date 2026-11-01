@@ -1,4 +1,4 @@
-﻿FishTweak v3.6.3
+﻿FishTweak v3.6.4
 ================
 捕鱼大决战专用插件（com.gzlj.fishdecisive）
 
@@ -9,7 +9,7 @@
   - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / retoken换token /
     游戏外直写16键plist+数据库 / 版本号查询 / 自动更新 + 老功能（发送短信 / 重置密码）
 
-【缓存登录机制 v3.6.3】
+【缓存登录机制 v3.6.4】
   按键精灵喂号 → daemon 收号：
     1) 查游戏数据库（<容器>/Documents/AnaestheticsYachtsman/zs_data.sqlite）有无该 openid
        - 有（有缓存）→ 【完全不动，不更新DB、不写plist】→ 返回 ok
@@ -33,6 +33,12 @@
     - 有缓存 → 完全不动（连 DB 也不更新），直接返回 ok，防止覆盖有效缓存
     - 需要注入 → 先 retoken（refresh token 换新 access token）→ 新 token 写 DB + 16键plist
     - retoken 失败(HTTP 400=封号) → 返回 {"ok":0,"saved":"...","ban":true}，不写任何东西
+  v3.6.4 变化（修"插件偶尔失效、重装才好"的根因）：
+    - 旧版 HTTP 服务单线程同步处理：retoken 卡 20s 或客户端半开连接会堵死整个 8888 服务，
+      按键精灵 HttpPost 超时返回空 = "插件失效"，且 launchd 不会拉起卡死的进程，只能重装
+    - 改为每连接独立线程处理（retoken 卡只影响那一个请求，其他账号照常）
+    - recv 加 5 秒超时（半开连接自动断开，不再永久卡死）
+    - sqlite busy 3 秒超时（游戏运行时占 DB 锁不再无限等）
   16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
     基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
     状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
@@ -56,7 +62,7 @@
    - 收号后不拉起游戏，按键精灵自己开
 2. 查询插件版本（自动更新比对用）:
    http://127.0.0.1:8888/status
-   返回: 3.6.3（纯文本，直接和版本号变量比较）
+   返回: 3.6.4（纯文本，直接和版本号变量比较）
 3. 发送改密码短信（老功能）:
    http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
 4. 重置密码（老功能）:
@@ -99,7 +105,7 @@ retoken（自动换 token）说明：
 【按键精灵自动更新代码（等插件升到期望版本）】
   用途：插件没到你要的版本时，自动 killall 让 daemon 重启检查更新，循环直到版本到位。
   ' 版本号变量：手动填写你期望的版本（如 3.6.3）
-  Dim 期望版本 = "3.6.3"
+  Dim 期望版本 = "3.6.4"
   Do
     Dim 当前版本 = URL.Get("http://127.0.0.1:8888/status")
     TracePrint "当前插件版本: " & 当前版本
