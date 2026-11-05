@@ -1,5 +1,5 @@
 // ============================================================
-//  fishtweakd —— 常驻 daemon（v3.6.5）
+//  fishtweakd —— 常驻 daemon（v3.6.6）
 //  职责：仅服务本机游戏《捕鱼大决战》(com.gzlj.fishdecisive)
 //  1) 监听 127.0.0.1:8888（本地回环，只服务按键精灵）
 //  2) /set_account 收号 → 判库 → 有缓存完全不动；需注入则先 retoken 换新 token → 写DB + 写16键plist
@@ -10,6 +10,7 @@
 //  v3.6.3：有缓存完全不动（连DB也不更新）；需注入先 retoken 换新 token；换不到=封号 → ban:true
 //  v3.6.4：防卡死——每连接独立线程处理（retoken 卡20s只影响自己）+ recv 5s超时 + sqlite busy 3s
 //  v3.6.5：写入前自建目录/库/表（父目录不存在也能写）；新增 force=1 强制重建（必先 retoken，DROP user_info 只留本号，清旧 plist 重写16键）
+//  v3.6.6：force 模式不再删除 plist 文件，恢复 v3.6.4 的整份覆盖写（16键）；force 只影响缓存判定与 DB 重建
 //  资源：单 accept 线程 + 每连接短线程，无轮询无后台任务，ARC 无泄漏
 // ============================================================
 #import <Foundation/Foundation.h>
@@ -222,8 +223,8 @@ static void writeUserInfoDb(NSDictionary *acct, BOOL force) {
 // ============================================================
 
 // 写游戏容器内 plist（16 键全量）并删除全局域同名 plist（游戏只读容器内，全局域是误写位置）
-// v3.6.5：force=1 时先删容器内旧 plist，再重写 16 键（不留旧键残留）
-static void writeGamePrefs(NSDictionary *acct, BOOL force) {
+// v3.6.6：不删容器内 plist，直接整份覆盖写（与原路线一致）；force 模式也走这里，不再清文件
+static void writeGamePrefs(NSDictionary *acct) {
     NSString *container = findDataContainer(kGameBundleId);
     if (!container) { fishlog(@"[writePrefs] 未找到游戏容器，放弃"); return; }
 
@@ -239,11 +240,6 @@ static void writeGamePrefs(NSDictionary *acct, BOOL force) {
     NSString *plistPath = [prefDir stringByAppendingPathComponent:@"com.gzlj.fishdecisive.plist"];
     [[NSFileManager defaultManager] createDirectoryAtPath:prefDir
                              withIntermediateDirectories:YES attributes:nil error:NULL];
-    // v3.6.5：force 强制重建 → 先清掉旧 plist，再重写 16 键
-    if (force && [[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-        [[NSFileManager defaultManager] removeItemAtPath:plistPath error:NULL];
-        fishlog(@"[writePrefs] force：已清除容器内旧 plist，准备重写 16 键");
-    }
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     [df setDateFormat:@"yyyyMMdd"];
     NSString *today = [df stringFromDate:[NSDate date]];
@@ -496,7 +492,7 @@ static void handleRequest(int clientSocket, NSString *request) {
 
     } else if ([reqPath isEqualToString:@"/status"]) {
         // v3.6.5：直接返回插件版本号（按键精灵比对用），不再返回 cache JSON
-        sendHttpText(clientSocket, @"3.6.5");
+        sendHttpText(clientSocket, @"3.6.6");
 
     } else if ([reqPath isEqualToString:@"/set_account"]) {
         NSString *openid = params[@"openid"];
@@ -512,7 +508,8 @@ static void handleRequest(int clientSocket, NSString *request) {
         // v3.6.2：数据接收成功即返回 ok，不再回 injected/launch
         // v3.6.3：已有缓存 → 完全不动（连 DB 也不更新）直接 ok；
         //         需要注入 → 先 retoken 换新 token 写 DB + 16键plist；换不到(封号) → 返回 ban:true，不写任何东西
-        // v3.6.5：force=1 → 跳过"有缓存不动"判定，强制 retoken + 重建（DB 只留本号 + plist 清空重写16键）
+        // v3.6.5：force=1 → 跳过"有缓存不动"判定，强制 retoken + 重建（DB 只留本号 + plist 整份覆盖写16键）
+        // v3.6.6：force 不再删除 plist 文件，plist 写入路径与正常模式完全相同
         NSString *forceStr = strParam(params, @"force");
         BOOL force = [forceStr boolValue];
         BOOL hasCache = force ? NO : dbHasOpenId(openid);
@@ -525,7 +522,7 @@ static void handleRequest(int clientSocket, NSString *request) {
                 NSMutableDictionary *p2 = [params mutableCopy];
                 p2[@"token"] = rt[@"token"];   // 用 retoken 换到的新 access_token 写 DB（避免登录失效）
                 writeUserInfoDb(p2, force);
-                writeGamePrefs(p2, force);
+                writeGamePrefs(p2);
                 fishlog(@"[set_account] 账号 %@ 注入完成%@（retoken 已换新token写DB + 16键plist，LastPwd=phonepass）", openid, force ? @"【force 强制重建】" : @"");
                 sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"ban": @NO});
             } else {
@@ -691,7 +688,7 @@ static void *httpThread(void *arg) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.5");
+        NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.6");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
         startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）
