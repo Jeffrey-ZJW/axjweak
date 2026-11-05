@@ -12,7 +12,7 @@
 【缓存登录机制 v3.6.6】
   按键精灵喂号 → daemon 收号：
     1) 查游戏数据库（<容器>/Documents/AnaestheticsYachtsman/zs_data.sqlite）有无该 openid
-       - 有（有缓存）→ 【完全不动，不更新DB、不写plist】→ 返回 ok
+       - 有（有缓存）→ 【完全不动，不更新DB、不写plist】→ 返回 ok=2
          ⚠️ 千万别对已有缓存的号再注入：会覆盖游戏里有效的缓存信息导致登录失效
        - 没有（需要注入）→ 先 retoken 换新 access token：
          - 换成功 → 用【新 token】写 DB + 写【容器内】plist 16 键 → 注入完成
@@ -52,6 +52,7 @@
     - force 模式不再删除容器内 plist 文件，改为和正常模式完全相同的整份覆盖写（16 键）
       （原 v3.6.5 的 removeItemAtPath 已去掉，避免写失败时旧 plist 直接丢失）
     - force 仍保留：必先 retoken、跳过"有缓存不动"判定、DB 里 DROP user_info 只留本号
+    - 返回值区分：正常模式有缓存跳过 → ok=2（什么都没写）；实际写入/force 重建 → ok=1
   16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
     基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
     状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
@@ -70,7 +71,8 @@
    - phonepass=明文密码（写 plist LastPwdAccount）
    - password=账号密码hex（AES 加密写 DB）
    - 返回:
-     成功: {"ok":1,"saved":"<openid>","ban":false}
+     成功（实际写入DB+plist）: {"ok":1,"saved":"<openid>","ban":false}
+     跳过（有缓存，什么都没写）: {"ok":2,"saved":"<openid>","ban":false}   ← 正常模式才会出现
      封号: {"ok":0,"saved":"<openid>","ban":true,"err":"banned"}   ← refresh 失效=封号，冻结该账号
      网络: {"ok":0,"saved":"<openid>","ban":false,"err":"network"} ← 可重试，不误冻结
    - 收号后不拉起游戏，按键精灵自己开
@@ -108,7 +110,7 @@ retoken（自动换 token）说明：
         Dim resp = Url.HttpPost(date1)      ' ← 真实响应：{"saved":"...","ok":1,"ban":false}
         TracePrint "响应: " & resp
         Dim rj = Cjson.Decode(resp)
-        If rj["ok"] = 1 Then Exit Do       ' ok 是数字 1
+        If rj["ok"] = 1 or rj["ok"] = 2 Then Exit Do   ' 1=已写入；2=有缓存跳过（都不需要重试）
         If rj["ban"] = true Then
             TracePrint "该账号已封号，冻结处理"
             Exit Function                   ' 或跳冻结流程
@@ -139,8 +141,8 @@ retoken（自动换 token）说明：
   - 两个参数各归各位，不要混用
 
 force 参数说明：
-  - 不传 / force=0：正常模式（有缓存完全不动；无缓存才 retoken + 注入）
-  - force=1：强制重建（不管库里/plist 里有没有这个号，都重新写一遍）
+  - 不传 / force=0：正常模式（有缓存完全不动，返回 ok=2；无缓存才 retoken + 注入，返回 ok=1）
+  - force=1：强制重建（不管库里/plist 里有没有这个号，都重新写一遍，一定返回 ok=1）
       · 必先 retoken 换新 access_token
       · DB user_info 先 DROP 再建 → 全表只保留本次注入的号
       · 容器内 plist 整份覆盖写 16 键（v3.6.6 起不再删除文件，避免写失败时旧 plist 丢失）

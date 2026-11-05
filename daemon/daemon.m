@@ -11,6 +11,7 @@
 //  v3.6.4：防卡死——每连接独立线程处理（retoken 卡20s只影响自己）+ recv 5s超时 + sqlite busy 3s
 //  v3.6.5：写入前自建目录/库/表（父目录不存在也能写）；新增 force=1 强制重建（必先 retoken，DROP user_info 只留本号，清旧 plist 重写16键）
 //  v3.6.6：force 模式不再删除 plist 文件，恢复 v3.6.4 的整份覆盖写（16键）；force 只影响缓存判定与 DB 重建
+//          有缓存跳过时 /set_account 返回 ok=2（实际注入/重写仍返回 ok=1）
 //  资源：单 accept 线程 + 每连接短线程，无轮询无后台任务，ARC 无泄漏
 // ============================================================
 #import <Foundation/Foundation.h>
@@ -514,8 +515,8 @@ static void handleRequest(int clientSocket, NSString *request) {
         BOOL force = [forceStr boolValue];
         BOOL hasCache = force ? NO : dbHasOpenId(openid);
         if (!force && hasCache) {
-            fishlog(@"[set_account] 账号 %@ 已有缓存，无需任何操作（不更新DB/plist）", openid);
-            sendHttp(clientSocket, @{@"ok": @1, @"saved": openid, @"ban": @NO});
+            fishlog(@"[set_account] 账号 %@ 已有缓存，无需任何操作（不更新DB/plist，返回 ok=2）", openid);
+            sendHttp(clientSocket, @{@"ok": @2, @"saved": openid, @"ban": @NO});
         } else {
             NSDictionary *rt = retoken(refresh);
             if ([rt[@"ok"] boolValue]) {
