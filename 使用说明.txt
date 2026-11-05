@@ -1,4 +1,4 @@
-﻿FishTweak v3.6.4
+﻿FishTweak v3.6.5
 ================
 捕鱼大决战专用插件（com.gzlj.fishdecisive）
 
@@ -9,7 +9,7 @@
   - fishtweakd（daemon）：系统常驻进程，收号 / 游戏外查库判定 / retoken换token /
     游戏外直写16键plist+数据库 / 版本号查询 / 自动更新 + 老功能（发送短信 / 重置密码）
 
-【缓存登录机制 v3.6.4】
+【缓存登录机制 v3.6.5】
   按键精灵喂号 → daemon 收号：
     1) 查游戏数据库（<容器>/Documents/AnaestheticsYachtsman/zs_data.sqlite）有无该 openid
        - 有（有缓存）→ 【完全不动，不更新DB、不写plist】→ 返回 ok
@@ -39,6 +39,15 @@
     - 改为每连接独立线程处理（retoken 卡只影响那一个请求，其他账号照常）
     - recv 加 5 秒超时（半开连接自动断开，不再永久卡死）
     - sqlite busy 3 秒超时（游戏运行时占 DB 锁不再无限等）
+  v3.6.5 变化（目录/库/表兜底 + 强制重建）：
+    - 写入前自动补齐：父目录 Documents/AnaestheticsYachtsman 不存在就建目录；
+      库文件不存在由 sqlite3_open 建库；user_info 表不存在由 CREATE TABLE IF NOT EXISTS 建表
+      → 游戏从未跑过（没目录/没库/没表）也能直接注入
+    - 新增 force 参数（force=1）：跳过"有缓存不动"判定，强制重建
+        · 必先 retoken 换新 access_token（400=封号则不写任何东西）
+        · 数据库 user_info 先 DROP 再重建 → 全表只保留本次注入的号
+        · 容器内 plist 先删掉再重写 16 键（不留旧键残留）
+    - 不传 force（或 force=0）时：行为与 v3.6.4 完全一致（有缓存完全不动；无缓存才注入）
   16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
     基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
     状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
@@ -53,6 +62,7 @@
 常驻 daemon 接口（127.0.0.1:8888）：
 1. 收号（缓存登录用）:
    http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D
+   - force=1 可选：强制重建（见上 v3.6.5）；不传或 force=0 = 正常模式
    - phonepass=明文密码（写 plist LastPwdAccount）
    - password=账号密码hex（AES 加密写 DB）
    - 返回:
@@ -62,7 +72,7 @@
    - 收号后不拉起游戏，按键精灵自己开
 2. 查询插件版本（自动更新比对用）:
    http://127.0.0.1:8888/status
-   返回: 3.6.4（纯文本，直接和版本号变量比较）
+   返回: 3.6.5（纯文本，直接和版本号变量比较）
 3. 发送改密码短信（老功能）:
    http://127.0.0.1:8888/send_sms?mobile=手机号&uuid=设备UUID
 4. 重置密码（老功能）:
@@ -84,6 +94,7 @@ retoken（自动换 token）说明：
 按键精灵调用示例：
   喂号：Url.Get("http://127.0.0.1:8888/set_account?appid=824949824&openid=jpSekM...&refresh=AtP84x...&token=XjA_wR...&nickname=用户43367832&account=13540336231&phone=13540336231&phonepass=5794402&password=1CE421333A535A1D")
   查版本：Url.Get("http://127.0.0.1:8888/status")
+  强制重建：在 POST body 里加 "force":1（或 URL 带 &force=1）
 
 【按键精灵收号代码（正确写法，勿把请求配置当响应）】
   Function 缓存注入()
@@ -105,7 +116,7 @@ retoken（自动换 token）说明：
 【按键精灵自动更新代码（等插件升到期望版本）】
   用途：插件没到你要的版本时，自动 killall 让 daemon 重启检查更新，循环直到版本到位。
   ' 版本号变量：手动填写你期望的版本（如 3.6.3）
-  Dim 期望版本 = "3.6.4"
+  Dim 期望版本 = "3.6.5"
   Do
     Dim 当前版本 = URL.Get("http://127.0.0.1:8888/status")
     TracePrint "当前插件版本: " & 当前版本
@@ -122,3 +133,12 @@ retoken（自动换 token）说明：
   - password 参数 = 账号密码hex（如 1CE421333A535A1D），daemon AES-128-ECB+PKCS7
     （key=Ze1QLUFj296TAho2）加密后写数据库 user_info.password
   - 两个参数各归各位，不要混用
+
+force 参数说明：
+  - 不传 / force=0：正常模式（有缓存完全不动；无缓存才 retoken + 注入）
+  - force=1：强制重建（不管库里/plist 里有没有这个号，都重新写一遍）
+      · 必先 retoken 换新 access_token
+      · DB user_info 先 DROP 再建 → 全表只保留本次注入的号
+      · 容器内 plist 先删再重写 16 键
+  - retoken 400=封号 → 强制模式同样什么都不写，返回 ban:true
+  - 强制模式会覆盖该环境已有缓存，只在明确要重建时用
