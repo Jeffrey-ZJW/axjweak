@@ -12,6 +12,8 @@
 //  v3.6.5：写入前自建目录/库/表（父目录不存在也能写）；新增 force=1 强制重建（必先 retoken，DROP user_info 只留本号，清旧 plist 重写16键）
 //  v3.6.6：force 模式不再删除 plist 文件，恢复 v3.6.4 的整份覆盖写（16键）；force 只影响缓存判定与 DB 重建
 //          有缓存跳过时 /set_account 返回 ok=2（实际注入/重写仍返回 ok=1）
+//  v3.6.6 测试构建（FakeIP）：/set_account 按 appid 生成固定自报 IP → 写 /var/mobile/Library/Preferences/com.jeffrey.fishtweak.plist
+//          tweak 侧（FakeIP.xm）启动读该值，命中 ip.buyuios.com 时替换响应体，实现"自报 IP 伪造"
 //  资源：单 accept 线程 + 每连接短线程，无轮询无后台任务，ARC 无泄漏
 // ============================================================
 #import <Foundation/Foundation.h>
@@ -38,6 +40,8 @@
 // ---- 固定路径（daemon 自用：日志；v3.6.0 起不再有"参数文件/状态文件"机制，缓存登录改为游戏外直写）----
 static NSString *const kLogFile     = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweakd.log";            // daemon 运行日志
 static NSString *const kGameBundleId = @"com.gzlj.fishdecisive";
+// v3.6.6 测试构建：自报 IP 配置（tweak 启动时直读文件，不经过 cfprefsd）
+static NSString *const kFakeIPConfigPath = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.plist";
 
 // ---- 文件日志（老 iOS 无 log 命令，syslog 不可靠；写文件最稳）----
 static void fishlog(NSString *fmt, ...) {
@@ -270,6 +274,53 @@ static void writeGamePrefs(NSDictionary *acct) {
     BOOL ok = [d writeToFile:plistPath atomically:YES];
     chmod([plistPath UTF8String], 0644);
     fishlog(@"[writePrefs] 容器内 plist 写入 %@ → %@ (16键)", plistPath, ok ? @"成功" : @"失败");
+}
+
+// ============================================================
+//  v3.6.6 测试构建：按 appid 生成固定自报 IP（FakeIP）
+//  规则：39.<第二段>.<第三段>.<第四段>
+//    · 第二段取自中国移动 39.128.0.0/10 内的省段池，各 appid 落到不同省段（做跨地区）
+//      145 = 安徽（真机已验证）；144 = 辽宁同省，故意不放进池子
+//    · 第三/四段由 appid 的 FNV-1a 哈希决定，范围 1~254（避开 .0 / .255）
+//    · 同一 appid 永远算出同一个 IP；不同 appid 落到不同 IP
+//  每次 /set_account 都重算并写配置（有缓存跳过的号也要写，否则会沿用上一个号的 IP）
+// ============================================================
+static uint64_t fakeIPHash(NSString *s) {
+    uint64_t h = 1469598103934665603ULL;      // FNV-1a 64 offset basis
+    const char *p = [s UTF8String];
+    while (p && *p) {
+        h ^= (uint64_t)(unsigned char)(*p++);
+        h *= 1099511628211ULL;                // FNV prime
+    }
+    return h;
+}
+
+static NSString *fakeIPForAppId(NSString *appid) {
+    if (appid.length == 0) return nil;
+    static const int kProvincePool[] = {145, 146, 147, 148, 149, 150, 151, 152};
+    const int poolCount = (int)(sizeof(kProvincePool) / sizeof(kProvincePool[0]));
+    uint64_t h = fakeIPHash([@"fishtweak-fakeip:" stringByAppendingString:appid]);
+    int second = kProvincePool[(h >> 40) % poolCount];
+    int third  = 1 + (int)((h >> 20) % 254);
+    int fourth = 1 + (int)(h % 254);
+    return [NSString stringWithFormat:@"39.%d.%d.%d", second, third, fourth];
+}
+
+static void writeFakeIPConfig(NSString *appid) {
+    if (appid.length == 0) {
+        fishlog(@"[fakeip] 未带 appid，跳过自报 IP 生成");
+        return;
+    }
+    NSString *ip = fakeIPForAppId(appid);
+    if (!ip) return;
+    NSMutableDictionary *cfg = [NSMutableDictionary dictionaryWithContentsOfFile:kFakeIPConfigPath];
+    if (!cfg) cfg = [NSMutableDictionary dictionary];
+    cfg[@"FakeIPValue"] = ip;
+    cfg[@"FakeIPAppId"] = appid;
+    cfg[@"FakeIPUpdateTime"] = @((long long)[[NSDate date] timeIntervalSince1970]);
+    BOOL ok = [cfg writeToFile:kFakeIPConfigPath atomically:YES];
+    chmod([kFakeIPConfigPath UTF8String], 0644);
+    fishlog(@"[fakeip] appid=%@ → 自报IP=%@（写入%@）", appid, ip, ok ? @"成功" : @"失败");
 }
 
 
@@ -511,6 +562,10 @@ static void handleRequest(int clientSocket, NSString *request) {
         //         需要注入 → 先 retoken 换新 token 写 DB + 16键plist；换不到(封号) → 返回 ban:true，不写任何东西
         // v3.6.5：force=1 → 跳过"有缓存不动"判定，强制 retoken + 重建（DB 只留本号 + plist 整份覆盖写16键）
         // v3.6.6：force 不再删除 plist 文件，plist 写入路径与正常模式完全相同
+        // v3.6.6 测试构建：按 appid 生成固定自报 IP 并写入配置
+        //   tweak 侧启动时直读该值，命中 ip.buyuios.com 时替换响应 → 全链路上报 IP 跟着变
+        //   放在缓存判定之前：有缓存跳过的号也要更新，否则会沿用上一个号的 IP
+        writeFakeIPConfig(strParam(params, @"appid"));
         NSString *forceStr = strParam(params, @"force");
         BOOL force = [forceStr boolValue];
         BOOL hasCache = force ? NO : dbHasOpenId(openid);

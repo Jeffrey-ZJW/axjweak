@@ -53,6 +53,15 @@
       （原 v3.6.5 的 removeItemAtPath 已去掉，避免写失败时旧 plist 直接丢失）
     - force 仍保留：必先 retoken、跳过"有缓存不动"判定、DB 里 DROP user_info 只留本号
     - 返回值区分：正常模式有缓存跳过 → ok=2（什么都没写）；实际写入/force 重建 → ok=1
+  v3.6.6 测试构建（FakeIP 自报IP伪造，仅单机测试用）：
+    - 收号时按 appid 生成一个固定假 IP（同一 appid 永远同一 IP），写进
+      /var/mobile/Library/Preferences/com.jeffrey.fishtweak.plist 的 FakeIPValue
+    - 规则：39.<省段>.<哈希段>.<哈希段>，第二段取自中国移动 39.128.0.0/10 省段池
+      （145=安徽，已实测；144=辽宁同省，故意排除），第三/四段 1~254 由 appid 哈希决定
+      → 不同 appid 落到不同省段/不同 IP，实现跨地区
+    - tweak 侧（FakeIP.xm）只改 GET https://ip.buyuios.com/ 的响应体，其余请求不动；
+      loginIP、Log/report 的 ip、api/ip/info 请求体、GameRunIP 全部随之变化
+    - 无开关：要停用就卸载插件回到原版；家庭/多机测试时不要把这个包给其他手机装
   16 键（全量，缺一组就进不去，2026-10-30 frida 递减实验实证）：
     基础4：ZSFirstStartupLaunchTime / LAST_LAUNCH_GAME_TIME / InstallAppVersion / Login_Agree
     状态4：LoginInitSDK / KEY_ONLINE_STATE_213 / device_id / unity.player_session_count
