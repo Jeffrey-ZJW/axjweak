@@ -6,20 +6,27 @@
 // ========================================
 //  v3.6.6 测试构建：自报公网 IP 伪造（FakeIP）
 //
-//  真机已验证的结论（详见 插件需求与实现规格_IP自报伪造_v1.md）：
+//  依据（经验库 ios-public-ip-single-source-gzip-response，真机实测结论）：
 //    · 客户端唯一的公网 IP 来源 = GET https://ip.buyuios.com/ 的响应正文
 //    · 该请求走 -[NSURLSession dataTaskWithRequest:completionHandler:]
-//    · 回调层拿到的已是解压后的 12~13 字节明文，不存在等长约束
+//    · completion 回调拿到的已是解压后的 12~13 字节明文，不存在等长约束
 //    · 只改这一处，loginIP / Log.report 的 ip / api/ip/info 请求体 / GameRunIP 全部跟着变
 //    · 必须在客户端取值处改，让它拿假 IP 自己算签名；事后改报文签名会对不上
 //
-//  本文件独立于 Tweak.xm，不改动任何现有函数；出问题整段删除即可回退。
+//  v2 修订（按 v3.4 的 hook 经验）：
+//    · %ctor 第一行无条件写日志（bundle + 进程名）：只要 dylib 进了进程就一定留痕
+//    · 加载判定放宽：bundle 命中 或 进程名 Fuel5 命中，任一即认（不再因 bundle 判定失败静默退出）
+//    · 配置无效也把 hook 挂上，回调里透传并说明原因（真机能看出"挂上了但没值"）
+//    · host 命中时打一行请求日志（能看出 hook 到底拦没拦到请求）
+//
 //  不要碰 GameRunIP（结果缓存）、不要碰 api/ip/info（消费方）、不要引入 gzip 逻辑。
 // ========================================
 
 static NSString *const kFakeIPConfigPath = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.plist";
 static NSString *const kFakeIPLogFile    = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweak.tweak.log";
 static NSString *const kFakeIPHost       = @"ip.buyuios.com";
+static NSString *const kFakeIPBundleId   = @"com.gzlj.fishdecisive";
+static NSString *const kFakeIPProcess    = @"Fuel5";
 
 static NSString *gFakeIP = nil;       // 本次进程生效的假 IP（启动时读一次）
 static BOOL gHookInstalled = NO;
@@ -86,21 +93,30 @@ static NSURLSessionDataTask *my_dataTaskWithRequest(id self, SEL _cmd, NSURLRequ
         return orig_dataTaskWithRequest(self, _cmd, request, handler);
     }
 
+    // 命中目标域名：先留痕，说明 hook 真的拦到了这个请求
+    fiplog(@"[FakeIP] 命中 host=%@ 请求，等待回调 (假IP=%@)", host, gFakeIP ?: @"(无)");
+
     void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
         NSData *outData = data;
         if (!error && [data isKindOfClass:[NSData class]] && data.length > 0 && data.length <= 15) {
             NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
             text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (text && fiIsValidIPv4(text)) {
-                NSData *fakeData = [gFakeIP dataUsingEncoding:NSUTF8StringEncoding];
-                if (fakeData) {
-                    outData = fakeData;
-                    fiplog(@"[FakeIP] 命中 ip.buyuios.com: %@ -> %@ (len %lu -> %lu)",
-                           text, gFakeIP, (unsigned long)data.length, (unsigned long)fakeData.length);
+                if (gFakeIP) {
+                    NSData *fakeData = [gFakeIP dataUsingEncoding:NSUTF8StringEncoding];
+                    if (fakeData) {
+                        outData = fakeData;
+                        fiplog(@"[FakeIP] 替换成功: %@ -> %@ (len %lu -> %lu)",
+                               text, gFakeIP, (unsigned long)data.length, (unsigned long)fakeData.length);
+                    }
+                } else {
+                    fiplog(@"[FakeIP] 拿到真实 IP %@，但没有假 IP 值，原样透传", text);
                 }
             } else {
                 fiplog(@"[FakeIP] 跳过: 返回不是合法 IPv4 (len=%lu)", (unsigned long)data.length);
             }
+        } else if (error) {
+            fiplog(@"[FakeIP] 跳过: 回调带错误 %@", error.localizedDescription);
         }
         // 三个参数顺序与语义不变
         handler(outData, response, error);
@@ -111,7 +127,7 @@ static NSURLSessionDataTask *my_dataTaskWithRequest(id self, SEL _cmd, NSURLRequ
     return orig_dataTaskWithRequest(self, _cmd, request, copiedHandler);
 }
 
-// ---- 运行时挂 hook（不用 %hook：开关关闭时必须一个 hook 都不挂）----
+// ---- 运行时挂 hook ----
 static void fiInstallHook(void) {
     if (gHookInstalled) return;
     Class cls = (Class)objc_getClass("NSURLSession");
@@ -132,17 +148,26 @@ static void fiInstallHook(void) {
 
 %ctor {
     @autoreleasepool {
+        // 第一步就留痕：只要 dylib 进到进程里，这一行一定写在 tweak 日志里
         NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        // 按键精灵也在 Filter 里，这里主动跳过，只对游戏生效
-        if (![bundleId isEqualToString:@"com.gzlj.fishdecisive"]) {
+        NSString *processName = [[NSProcessInfo processInfo] processName] ?: @"";
+        fiplog(@"[FakeIP] ctor 进入 bundle=%@ process=%@", bundleId, processName);
+
+        // 判定放宽：bundle 命中 或 进程名命中，任一即认（按键精灵两个都不命中，自动跳过）
+        BOOL isGame = [bundleId isEqualToString:kFakeIPBundleId] ||
+                      [processName isEqualToString:kFakeIPProcess];
+        if (!isGame) {
+            fiplog(@"[FakeIP] 非游戏进程，跳过（不挂 hook）");
             return;
         }
+        fiplog(@"[FakeIP] 判定为游戏进程（bundle命中=%d 进程名命中=%d）",
+               [bundleId isEqualToString:kFakeIPBundleId] ? 1 : 0,
+               [processName isEqualToString:kFakeIPProcess] ? 1 : 0);
+
         gFakeIP = fiLoadFakeIP();
-        if (!gFakeIP) {
-            fiplog(@"[FakeIP] 配置里没有有效的 FakeIPValue，本次不挂任何 hook（走真实 IP）");
-            return;
-        }
-        fiplog(@"[FakeIP] 模块加载，目标 IP=%@", gFakeIP);
+        fiplog(@"[FakeIP] 读取配置 FakeIPValue=%@", gFakeIP ?: @"(缺失或非法)");
+
+        // 配置无效也挂 hook：真机日志能区分"没挂上"和"挂上了但没值"
         fiInstallHook();
     }
 }
