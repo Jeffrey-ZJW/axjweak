@@ -278,9 +278,11 @@ static void writeGamePrefs(NSDictionary *acct) {
 
 // ============================================================
 //  v3.6.6 测试构建：按 appid 生成固定自报 IP（FakeIP）
-//  规则：39.<第二段>.<第三段>.<第四段>
-//    · 第二段取自中国移动 39.128.0.0/10 内的省段池，各 appid 落到不同省段（做跨地区）
-//      145 = 安徽（真机已验证）；144 = 辽宁同省，故意不放进池子
+//  规则：<第一段>.<第二段>.<第三段>.<第四段>（家庭宽带风格，跨运营商/跨地区）
+//    · 第一段取自家宽/固网 A 段池：电信 1/58/59/60/61/202/203/218/219、
+//      联通 123/124/125/126/155/156/171/175/176、移动固网 120/121/122/127
+//      （按 appid 哈希选运营商+网段，第一段不再固定，已去掉 39 手机流量段）
+//    · 第二段由 appid 哈希在 16~254 之间取值，各 appid 落到不同省段（做跨地区）
 //    · 第三/四段由 appid 的 FNV-1a 哈希决定，范围 1~254（避开 .0 / .255）
 //    · 同一 appid 永远算出同一个 IP；不同 appid 落到不同 IP
 //  每次 /set_account 都重算并写配置（有缓存跳过的号也要写，否则会沿用上一个号的 IP）
@@ -297,13 +299,17 @@ static uint64_t fakeIPHash(NSString *s) {
 
 static NSString *fakeIPForAppId(NSString *appid) {
     if (appid.length == 0) return nil;
-    static const int kProvincePool[] = {145, 146, 147, 148, 149, 150, 151, 152};
-    const int poolCount = (int)(sizeof(kProvincePool) / sizeof(kProvincePool[0]));
+    // 家庭宽带/固网 A 段池（跨运营商：电信、联通、移动固网；已去掉 39 手机流量段）
+    static const int kFirstPool[] = {1, 58, 59, 60, 61, 202, 203, 218, 219,
+                                     123, 124, 125, 126, 155, 156, 171, 175, 176,
+                                     120, 121, 122, 127};
+    const int firstCount = (int)(sizeof(kFirstPool) / sizeof(kFirstPool[0]));
     uint64_t h = fakeIPHash([@"fishtweak-fakeip:" stringByAppendingString:appid]);
-    int second = kProvincePool[(h >> 40) % poolCount];
+    int first  = kFirstPool[(h >> 48) % firstCount];
+    int second = 16 + (int)((h >> 40) % 239);      // 16~254，跨省
     int third  = 1 + (int)((h >> 20) % 254);
     int fourth = 1 + (int)(h % 254);
-    return [NSString stringWithFormat:@"39.%d.%d.%d", second, third, fourth];
+    return [NSString stringWithFormat:@"%d.%d.%d.%d", first, second, third, fourth];
 }
 
 static void writeFakeIPConfig(NSString *appid) {
