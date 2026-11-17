@@ -73,6 +73,7 @@ static uint64_t g_acc = 0;        // 本人 account_id
 static long long g_coin = 0;      // 金币
 static int g_max_gap = 0;         // 个人最高炮倍档
 static int g_rate_max = 0;        // 倍率上限
+static volatile int g_hit = 0;    // 命中已知协议的帧数（热路径只自增）
 
 // ================= 写文件 =================
 static void write_file(const char *path, const char *s, int len) {
@@ -200,8 +201,7 @@ static void apply_base(const uint8_t *b, size_t n) {
         g_rate_max = 0;
     }
     if (coin >= 0) g_coin = coin;
-    if (mg > 0) g_max_gap = mg;
-    write_state_locked();
+    if (mg > 0) g_max_gap = mg;   // 只更新内存，落盘交给 1 秒线程
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -240,8 +240,7 @@ static void apply_table_info(const uint8_t *b, size_t n) {
 
     pthread_mutex_lock(&g_lock);
     if (mg > 0) g_max_gap = mg;
-    if (rate > 0) g_rate_max = rate;
-    write_state_locked();
+    if (rate > 0) g_rate_max = rate;   // 只更新内存
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -277,8 +276,7 @@ static void apply_change_attr(const uint8_t *b, size_t n) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    g_coin = coin;
-    write_state_locked();
+    g_coin = coin;   // 只更新内存
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -306,9 +304,9 @@ static void parse_frame(const uint8_t *fr, size_t total) {
     size_t subl = (size_t)sl;
 
 #define IS(s) (nlen == sizeof(s) - 1 && memcmp(name, s, nlen) == 0)
-    if (IS("proto.sc_player_by_base_data")) { flog("[FishState] HIT base len=%zu", nlen); apply_base(sub, subl); }
-    else if (IS("proto.sc_player_by_table_info")) { flog("[FishState] HIT table len=%zu", nlen); apply_table_info(sub, subl); }
-    else if (IS("proto.sc_player_by_change_attr")) { flog("[FishState] HIT attr len=%zu", nlen); apply_change_attr(sub, subl); }
+    if (IS("proto.sc_player_by_base_data")) { __sync_add_and_fetch(&g_hit, 1); apply_base(sub, subl); }
+    else if (IS("proto.sc_player_by_table_info")) { __sync_add_and_fetch(&g_hit, 1); apply_table_info(sub, subl); }
+    else if (IS("proto.sc_player_by_change_attr")) { __sync_add_and_fetch(&g_hit, 1); apply_change_attr(sub, subl); }
 #undef IS
 }
 
@@ -343,39 +341,65 @@ static void feed(const uint8_t *d, size_t n) {
     pthread_mutex_unlock(&g_buf_lock);
 }
 
-// ================= 挂钩 =================
-// 收包只走 recvfrom（recv 抓不到任何数据，已实测）
+// ================= 挂钩（热路径零 IO，1 秒统一处理） =================
+// 只挂 recvfrom：recv 是 libsystem 里的超短 syscall 跳转桩，
+// MSHookFunction 挂上去会让游戏直接崩，这里绝不挂 recv。
 // alen 在 Darwin 上是 socklen_t*（4 字节无符号），不是 size_t*
 static ssize_t (*orig_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
-static ssize_t (*orig_recv)(int, void *, size_t, int);
-static int g_n_rf = 0, g_n_rv = 0;
+static volatile int g_n_rf = 0;         // 收到多少次
+static uint8_t g_smp[64];               // 最近一次报文的前 64 字节
+static volatile size_t g_smpn = 0;
+static volatile int g_need_smp = 1;     // 1 = 需要抓一份新样本
 
 static ssize_t my_recvfrom(int s, void *buf, size_t len, int flags,
                            struct sockaddr *addr, socklen_t *alen) {
     ssize_t r = orig_recvfrom(s, buf, len, flags, addr, alen);
     if (r > 0) {
-        int c = __sync_add_and_fetch(&g_n_rf, 1);
-        if (c <= 30 || c % 300 == 0) flog("[FishState] recvfrom #%d r=%zd", c, (ssize_t)r);
-        feed((const uint8_t *)buf, (size_t)r);
+        __sync_add_and_fetch(&g_n_rf, 1);
+        if (g_need_smp) {                       // 只做一次 64 字节 memcpy，不碰磁盘
+            size_t k = (size_t)r > 64 ? 64 : (size_t)r;
+            memcpy(g_smp, buf, k);
+            g_smpn = k;
+            g_need_smp = 0;
+        }
+        feed((const uint8_t *)buf, (size_t)r);  // 纯内存解析
     }
     return r;
 }
 
-static ssize_t my_recv(int s, void *buf, size_t len, int flags) {
-    ssize_t r = orig_recv(s, buf, len, flags);
-    if (r > 0) {
-        int c = __sync_add_and_fetch(&g_n_rv, 1);
-        if (c <= 30 || c % 300 == 0) flog("[FishState] recv #%d r=%zd", c, (ssize_t)r);
-        feed((const uint8_t *)buf, (size_t)r);
+// 1 秒线程：写 json + 打一行采样日志（所有磁盘 IO 都只在这里发生）
+static void *fish_monitor(void *arg) {
+    (void)arg;
+    int lastn = -1;
+    while (1) {
+        sleep(1);
+
+        int n = g_n_rf;
+        if (n != lastn) {
+            lastn = n;
+            size_t k = g_smpn;
+            if (k > 32) k = 32;
+            char hex[128];
+            int o = 0;
+            for (size_t i = 0; i < k && o < 100; i++)
+                o += snprintf(hex + o, sizeof(hex) - (size_t)o, "%02x", g_smp[i]);
+            if (o == 0) snprintf(hex, sizeof hex, "(none)");
+            flog("[FishState] rf=%d hit=%d sample=%s", n, g_hit, hex);
+            g_need_smp = 1;
+        }
+
+        pthread_mutex_lock(&g_lock);
+        write_state_locked();     // 内部已做“内容没变不写”
+        pthread_mutex_unlock(&g_lock);
     }
-    return r;
+    return NULL;
 }
 
 %ctor {
-    if (!is_game_process()) return;
+    if (!is_game_process()) return;   // 按键精灵等其它进程不碰这个文件
     MSHookFunction((void *)recvfrom, (void *)my_recvfrom, (void **)&orig_recvfrom);
-    MSHookFunction((void *)recv, (void *)my_recv, (void **)&orig_recv);
-    write_state_locked();   // 启动即写一份全 0，保证文件存在
+    write_state_locked();             // 启动即写一份全 0，保证文件存在
     flog("[FishState] armed, out=%s", OUT_PATH);
-    NSLog(@"[FishState] armed, out=%s", OUT_PATH);
+    pthread_t th;
+    if (pthread_create(&th, NULL, fish_monitor, NULL) == 0) pthread_detach(th);
 }
