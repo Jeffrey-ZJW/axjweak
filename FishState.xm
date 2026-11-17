@@ -33,6 +33,40 @@ static int gap_to_bet(int gap) {
     return 0; // 未知
 }
 
+// ================= 进程判定 + 调试日志 =================
+#import <mach-o/dyld.h>
+#import <stdarg.h>
+#import <time.h>
+
+// 只在游戏进程生效：避免按键精灵等其它被 filter 的进程也写同一个 json
+static int is_game_process(void) {
+    static int c = -1;
+    if (c >= 0) return c;
+    char p[1024];
+    uint32_t sz = sizeof(p);
+    c = 0;
+    if (_NSGetExecutablePath(p, &sz) == 0 && strstr(p, "Fuel5.app/Fuel5")) c = 1;
+    return c;
+}
+
+#define FLOG_PATH "/var/mobile/Library/Preferences/com.jeffrey.fishtweak.tweak.log"
+
+static void flog(const char *fmt, ...) {
+    FILE *f = fopen(FLOG_PATH, "a");
+    if (!f) return;
+    char ts[32];
+    time_t t = time(NULL);
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&t));
+    fprintf(f, "[%s] ", ts);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+    fclose(f);
+}
+
 // ================= 全局状态 =================
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_acc = 0;        // 本人 account_id
@@ -272,9 +306,9 @@ static void parse_frame(const uint8_t *fr, size_t total) {
     size_t subl = (size_t)sl;
 
 #define IS(s) (nlen == sizeof(s) - 1 && memcmp(name, s, nlen) == 0)
-    if (IS("proto.sc_player_by_base_data")) apply_base(sub, subl);
-    else if (IS("proto.sc_player_by_table_info")) apply_table_info(sub, subl);
-    else if (IS("proto.sc_player_by_change_attr")) apply_change_attr(sub, subl);
+    if (IS("proto.sc_player_by_base_data")) { flog("[FishState] HIT base len=%zu", nlen); apply_base(sub, subl); }
+    else if (IS("proto.sc_player_by_table_info")) { flog("[FishState] HIT table len=%zu", nlen); apply_table_info(sub, subl); }
+    else if (IS("proto.sc_player_by_change_attr")) { flog("[FishState] HIT attr len=%zu", nlen); apply_change_attr(sub, subl); }
 #undef IS
 }
 
@@ -313,16 +347,35 @@ static void feed(const uint8_t *d, size_t n) {
 // 收包只走 recvfrom（recv 抓不到任何数据，已实测）
 // alen 在 Darwin 上是 socklen_t*（4 字节无符号），不是 size_t*
 static ssize_t (*orig_recvfrom)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+static ssize_t (*orig_recv)(int, void *, size_t, int);
+static int g_n_rf = 0, g_n_rv = 0;
 
 static ssize_t my_recvfrom(int s, void *buf, size_t len, int flags,
                            struct sockaddr *addr, socklen_t *alen) {
     ssize_t r = orig_recvfrom(s, buf, len, flags, addr, alen);
-    if (r > 0) feed((const uint8_t *)buf, (size_t)r);
+    if (r > 0) {
+        int c = __sync_add_and_fetch(&g_n_rf, 1);
+        if (c <= 30 || c % 300 == 0) flog("[FishState] recvfrom #%d r=%zd", c, (ssize_t)r);
+        feed((const uint8_t *)buf, (size_t)r);
+    }
+    return r;
+}
+
+static ssize_t my_recv(int s, void *buf, size_t len, int flags) {
+    ssize_t r = orig_recv(s, buf, len, flags);
+    if (r > 0) {
+        int c = __sync_add_and_fetch(&g_n_rv, 1);
+        if (c <= 30 || c % 300 == 0) flog("[FishState] recv #%d r=%zd", c, (ssize_t)r);
+        feed((const uint8_t *)buf, (size_t)r);
+    }
     return r;
 }
 
 %ctor {
+    if (!is_game_process()) return;
     MSHookFunction((void *)recvfrom, (void *)my_recvfrom, (void **)&orig_recvfrom);
+    MSHookFunction((void *)recv, (void *)my_recv, (void **)&orig_recv);
     write_state_locked();   // 启动即写一份全 0，保证文件存在
+    flog("[FishState] armed, out=%s", OUT_PATH);
     NSLog(@"[FishState] armed, out=%s", OUT_PATH);
 }
