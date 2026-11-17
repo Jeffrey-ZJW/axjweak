@@ -326,8 +326,13 @@ static void feed(const uint8_t *d, size_t n) {
 
     size_t off = 0;
     while (g_len - off >= 4) {
-        uint32_t tl = ((uint32_t)g_buf[off] << 24) | ((uint32_t)g_buf[off + 1] << 16)
+        // 帧头 4 字节长度：真机抓到的报文是 “22 00 00 00”（小端，长度在前），
+        // 而移植资料里的样例是大端写法，两种都兼容，取合理值
+        uint32_t le = (uint32_t)g_buf[off] | ((uint32_t)g_buf[off + 1] << 8)
+                    | ((uint32_t)g_buf[off + 2] << 16) | ((uint32_t)g_buf[off + 3] << 24);
+        uint32_t be = ((uint32_t)g_buf[off] << 24) | ((uint32_t)g_buf[off + 1] << 16)
                     | ((uint32_t)g_buf[off + 2] << 8) | (uint32_t)g_buf[off + 3];
+        uint32_t tl = (le > 3 && le <= 60000) ? le : be;
         if (tl == 0 || tl > 60000) { off += 1; continue; }  // 帧头不可信则滑动
         size_t total = (size_t)tl + 4;
         if (off + total > g_len) break;                     // 数据还没到齐，等下一次
