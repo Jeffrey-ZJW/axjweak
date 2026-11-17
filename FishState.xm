@@ -75,6 +75,12 @@ static int g_max_gap = 0;         // 个人最高炮倍档
 static int g_rate_max = 0;        // 倍率上限
 static volatile int g_hit = 0;    // 命中已知协议的帧数（热路径只自增）
 
+// 协议名统计表：把收到的所有不同协议名记下来（诊断用，最多 12 个）
+#define NNAMES 12
+static char g_nm[NNAMES][40];
+static int g_nmc[NNAMES];
+static volatile int g_nmn = 0;
+
 // ================= 写文件 =================
 static void write_file(const char *path, const char *s, int len) {
     FILE *f = fopen(path, "w");
@@ -294,6 +300,21 @@ static void parse_frame(const uint8_t *fr, size_t total) {
     size_t nlen = (size_t)nl;
     p += nlen;
 
+    // 记账：这个名字见过几次（只统计，不落盘）
+    if (nlen < 40) {
+        int i, done = 0;
+        for (i = 0; i < g_nmn; i++) {
+            if (g_nm[i][0] && strncmp(g_nm[i], (const char *)name, nlen) == 0
+                && (size_t)strlen(g_nm[i]) == nlen) { g_nmc[i]++; done = 1; break; }
+        }
+        if (!done && g_nmn < NNAMES) {
+            memcpy(g_nm[g_nmn], name, nlen);
+            g_nm[g_nmn][nlen] = 0;
+            g_nmc[g_nmn] = 1;
+            g_nmn++;
+        }
+    }
+
     if (p >= total || fr[p] != 0x12) return;
     p++;
     uint64_t sl;
@@ -391,6 +412,12 @@ static void *fish_monitor(void *arg) {
             if (o == 0) snprintf(hex, sizeof hex, "(none)");
             flog("[FishState] rf=%d hit=%d sample=%s", n, g_hit, hex);
             g_need_smp = 1;
+
+            char nb[420];
+            int o2 = 0;
+            for (int i = 0; i < g_nmn && o2 < 380; i++)
+                o2 += snprintf(nb + o2, sizeof(nb) - (size_t)o2, "%s:%d ", g_nm[i], g_nmc[i]);
+            flog("[FishState] names=%s", o2 ? nb : "(none)");
         }
 
         pthread_mutex_lock(&g_lock);
