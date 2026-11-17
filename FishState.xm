@@ -75,8 +75,13 @@ static int g_max_gap = 0;         // 个人最高炮倍档
 static int g_rate_max = 0;        // 倍率上限
 static volatile int g_hit = 0;    // 命中已知协议的帧数（热路径只自增）
 
-// 协议名统计表：把收到的所有不同协议名记下来（诊断用，最多 12 个）
-#define NNAMES 12
+// 命中帧快照（诊断用：抓一帧完整的命中报文，交给 1 秒线程打印）
+static uint8_t g_hb[240];
+static volatile size_t g_hbn = 0;
+static volatile int g_hbf = 0;
+
+// 协议名统计表：把收到的所有不同协议名记下来（诊断用，最多 20 个）
+#define NNAMES 20
 static char g_nm[NNAMES][40];
 static int g_nmc[NNAMES];
 static volatile int g_nmn = 0;
@@ -286,6 +291,15 @@ static void apply_change_attr(const uint8_t *b, size_t n) {
     pthread_mutex_unlock(&g_lock);
 }
 
+// ---- 命中帧快照：只做一次 memcpy，不碰磁盘 ----
+static void snap(const uint8_t *fr, size_t total) {
+    if (g_hbf) return;
+    size_t k = total > sizeof(g_hb) ? sizeof(g_hb) : total;
+    memcpy(g_hb, fr, k);
+    g_hbn = k;
+    g_hbf = 1;
+}
+
 // ---- 单帧解析：4字节大端长度 + 0a协议名 + 12子消息 ----
 static void parse_frame(const uint8_t *fr, size_t total) {
     if (total < 8) return;
@@ -325,9 +339,10 @@ static void parse_frame(const uint8_t *fr, size_t total) {
     size_t subl = (size_t)sl;
 
 #define IS(s) (nlen == sizeof(s) - 1 && memcmp(name, s, nlen) == 0)
-    if (IS("proto.sc_player_by_base_data")) { __sync_add_and_fetch(&g_hit, 1); apply_base(sub, subl); }
-    else if (IS("proto.sc_player_by_table_info")) { __sync_add_and_fetch(&g_hit, 1); apply_table_info(sub, subl); }
-    else if (IS("proto.sc_player_by_change_attr")) { __sync_add_and_fetch(&g_hit, 1); apply_change_attr(sub, subl); }
+    if (IS("proto.sc_player_by_base_data")) { __sync_add_and_fetch(&g_hit, 1); snap(fr, total); apply_base(sub, subl); }
+    else if (IS("proto.sc_player_by_table_info")) { __sync_add_and_fetch(&g_hit, 1); snap(fr, total); apply_table_info(sub, subl); }
+    else if (IS("proto.sc_player_by_attr")) { __sync_add_and_fetch(&g_hit, 1); snap(fr, total); apply_change_attr(sub, subl); }
+    else if (IS("proto.sc_player_by_change_attr")) { __sync_add_and_fetch(&g_hit, 1); snap(fr, total); apply_change_attr(sub, subl); }
 #undef IS
 }
 
@@ -418,6 +433,16 @@ static void *fish_monitor(void *arg) {
             for (int i = 0; i < g_nmn && o2 < 380; i++)
                 o2 += snprintf(nb + o2, sizeof(nb) - (size_t)o2, "%s:%d ", g_nm[i], g_nmc[i]);
             flog("[FishState] names=%s", o2 ? nb : "(none)");
+
+            if (g_hbf) {   // 命中帧完整内容
+                size_t k = g_hbn;
+                char hb[760];
+                int o3 = 0;
+                for (size_t i = 0; i < k && o3 < 720; i++)
+                    o3 += snprintf(hb + o3, sizeof(hb) - (size_t)o3, "%02x", g_hb[i]);
+                flog("[FishState] HITFRAME n=%zu %s", k, hb);
+                g_hbf = 0;
+            }
         }
 
         pthread_mutex_lock(&g_lock);
