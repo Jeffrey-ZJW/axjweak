@@ -539,6 +539,16 @@ static void handleRequest(int clientSocket, NSString *request) {
             sendHttp(clientSocket, @{@"ok": @2, @"pid": @(pid), @"msg": @"already_injected"});
             return;
         }
+        // 【关键】Filter 命中游戏时 Substrate 会自动注入，且不会创建上面的标记文件。
+        //   若此时再 cynject 一次 → 同一进程二次 dlopen/二次 MSHookFunction → 钩子链被打死（表现：卡登录、四项全 0）。
+        //   所以注入前先探测插件内置的 5399：能 ping 通 = 插件已经在这个游戏进程里活着，直接跳过。
+        NSString *probe = pluginCmd(@"ping");
+        if (probe.length) {
+            [[NSFileManager defaultManager] createFileAtPath:mark contents:nil attributes:nil];
+            fishlog(@"[inject] pid=%d 插件已在运行（ping 通），跳过 cynject 避免二次注入", (int)pid);
+            sendHttp(clientSocket, @{@"ok": @2, @"pid": @(pid), @"msg": @"already_running"});
+            return;
+        }
         NSString *cmd = [NSString stringWithFormat:
             @"rm -f /private/var/mobile/Media/Downloads/fish_state.json; "
              "cynject %d /Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib 2>&1; touch %@",

@@ -22,14 +22,13 @@ INSTALL_TARGETS = fishtweak fishtweakd
 # before-stage:: runs BEFORE layout is copied to stage dir (before-package::
 # runs after copying, no effect on .deb). git/zip upload loses exec bit;
 # dpkg requires >=0555 <=0775.
-# NOTE: 包里装的 fishtweak.plist 的 Filter 只匹配按键精灵 "com.cyjh.MobileAnjiandjz"，
-#       故意不匹配游戏 com.gzlj.fishdecisive —— 游戏侧改为手动注入（daemon POST /inject），
-#       避免「没调注入命令就自动进了插件」导致卡登录 / 钩子二次挂载。
-#       按键精灵侧必须自动注入，因为广告屏蔽（Tweak.xm v3.3）只在按键精灵进程里生效；
-#       该进程里 FishState 的 %ctor 会因 !is_game_process() 直接 return，
-#       不起 5399 端口、不写 fish_state.json、不挂网络 hook，与游戏侧互不干扰。
-#       需要恢复游戏自动注入时，把仓库里的 fishtweak.plist.sample 覆盖到
-#       /Library/MobileSubstrate/DynamicLibraries/fishtweak.plist 再 respring。
+# NOTE: fishtweak.plist 的 Filter 恢复为两条（与老版本完全一致）：
+#         com.gzlj.fishdecisive    游戏进程启动即注入 —— IDFA/时间/VPN/缓存登录免验证码等老功能全靠这条，
+#                                  且注入发生在登录前，登录包（账号/金币/最大炮倍）才接得住。
+#         com.cyjh.MobileAnjiandjz 按键精灵进程启动即注入 —— 用于屏蔽它的开屏/弹窗广告。
+#       注意：这两条是老功能，绝不能删。新功能（读四项 / 改炮倍 / 改倍率）走 daemon 8888 手动接口，
+#       但"防二次注入"由 daemon 的 /inject 负责：它先 ping 插件 5399，活着就直接返回 already_running，
+#       绝不再 cynject 一次（二次注入会打死钩子链，表现为卡登录、四项全 0）。
 before-stage::
 	chmod 755 layout/DEBIAN/postinst layout/DEBIAN/prerm
 	@mkdir -p layout/Library/MobileSubstrate/DynamicLibraries
