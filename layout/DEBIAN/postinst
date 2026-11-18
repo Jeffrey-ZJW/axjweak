@@ -1,4 +1,18 @@
 #!/bin/sh
 # fishtweak 安装后：装载常驻 daemon
+#
+# 关键：daemon 由 launchd 拉起，二进制必须带有效签名，否则 launchctl load 后
+#       进程根本起不来（launchctl list 显示 "-  -9"，端口 8888 不应答）。
+#       dpkg 解包不会重新签名，所以这里强制重签一次。
+if [ -f /usr/bin/fishtweakd ]; then
+    chmod 755 /usr/bin/fishtweakd
+    ldid -S /usr/bin/fishtweakd 2>/dev/null || true
+fi
+
+chmod 755 /Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib 2>/dev/null || true
+
+killall -9 fishtweakd 2>/dev/null || true
+launchctl unload -w /Library/LaunchDaemons/com.jeffrey.fishtweak.daemon.plist 2>/dev/null || true
 launchctl load -w /Library/LaunchDaemons/com.jeffrey.fishtweak.daemon.plist 2>/dev/null || true
+
 exit 0

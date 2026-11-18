@@ -1,0 +1,13 @@
+# 强制 LF：iOS 上 /bin/sh 执行带 CR 的脚本会失败（shebang 行尤其致命）
+* text=auto eol=lf
+layout/DEBIAN/* text eol=lf
+*.sh        text eol=lf
+Makefile    text eol=lf
+*.xm        text eol=lf
+*.m         text eol=lf
+*.plist     text eol=lf
+*.plist.sample text eol=lf
+
+# 二进制
+*.deb binary
+*.dylib binary

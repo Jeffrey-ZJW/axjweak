@@ -1,0 +1,8 @@
+# 构建产物与本地缓存，不入库
+*.deb
+packages/
+.theos/
+obj/
+*.o
+*.dylib
+.DS_Store

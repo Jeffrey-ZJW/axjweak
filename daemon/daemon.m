@@ -34,6 +34,8 @@
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
 #include <sqlite3.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 
 // ---- 固定路径（daemon 自用：日志；v3.6.0 起不再有"参数文件/状态文件"机制，缓存登录改为游戏外直写）----
 static NSString *const kLogFile     = @"/var/mobile/Library/Preferences/com.jeffrey.fishtweakd.log";            // daemon 运行日志
@@ -62,6 +64,7 @@ static void fishlog(NSString *fmt, ...) {
 static NSString *const kAPIHost = @"https://openapi.buyuios.com";
 static NSString *const kPackageNo = @"10011001001";
 static const int kLocalPort = 8888;
+static const int kPluginPort = 5399;   // 插件内 TCP 控制接口
 static NSString *const kKeyHex = @"5a6531514c55466a3239365441686f32576963364f4e33704f6572727a516f31";
 static NSString *const kIvHex  = @"5a6531514c55466a3239365441686f32";
 
@@ -429,6 +432,35 @@ static void sendHttpText(int clientSocket, NSString *text) {
     close(clientSocket);
 }
 
+// 【8888 统一入口】把 data/state/cannon/rate/clear/ping 转发给插件内的 TCP 5399
+// 插件没注入 → connect 失败 → 返回 ok=0 plugin_down
+static NSString *pluginCmd(NSString *cmdLine) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return nil;
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(kPluginPort);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(s, (struct sockaddr *)&a, sizeof(a)) != 0) { close(s); return nil; }
+    NSString *line = [cmdLine stringByAppendingString:@"\n"];
+    send(s, line.UTF8String, strlen(line.UTF8String), 0);
+    char buf[8192];
+    ssize_t n = recv(s, buf, sizeof(buf) - 1, 0);
+    close(s);
+    if (n <= 0) return nil;
+    buf[n] = 0;
+    return [[NSString stringWithUTF8String:buf] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static NSString *shellOutput(NSString *cmd);    // 定义见文件后部（自动更新段）
+static pid_t findProcPid(const char *want);   // 定义见文件后部（自动注入线程之前）
+
 static void handleRequest(int clientSocket, NSString *request) {
     NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
     if (lines.count == 0) return;
@@ -438,6 +470,7 @@ static void handleRequest(int clientSocket, NSString *request) {
     NSURLComponents *components = [NSURLComponents componentsWithString:[NSString stringWithFormat:@"http://localhost%@", path]];
     NSString *reqPath = components.path;
     NSMutableDictionary *params = [NSMutableDictionary dictionary];
+    fishlog(@"[req] %@ %@", parts[0], path);   // 每个请求都留痕，便于判断按键精灵到底有没有连上
     for (NSURLQueryItem *item in components.queryItems) {
         params[item.name] = item.value;
     }
@@ -491,6 +524,59 @@ static void handleRequest(int clientSocket, NSString *request) {
             sendHttp(clientSocket, resp);
         });
 
+    } else if ([reqPath isEqualToString:@"/inject"]) {
+        // 【按键精灵注入接口】v3.6.6 补充：/inject 触发对当前 Fuel5 进程的 cynject
+        //   幂等：同一 pid 只注入一次（重复 dlopen 同一路径虽去重，但二次 %ctor 会搞死钩子链）
+        //   返回：ok=1 注入成功；ok=2 该 pid 已注入；ok=0 游戏没在跑（err=no_game）
+        pid_t pid = findProcPid("Fuel5");
+        if (pid <= 0) {
+            sendHttp(clientSocket, @{@"ok": @0, @"err": @"no_game"});
+            return;
+        }
+        NSString *mark = [NSString stringWithFormat:@"/tmp/.fishtweak_inj_%d", (int)pid];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:mark]) {
+            fishlog(@"[inject] pid=%d 已注入过，幂等跳过", (int)pid);
+            sendHttp(clientSocket, @{@"ok": @2, @"pid": @(pid), @"msg": @"already_injected"});
+            return;
+        }
+        NSString *cmd = [NSString stringWithFormat:
+            @"rm -f /private/var/mobile/Media/Downloads/fish_state.json; "
+             "cynject %d /Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib 2>&1; touch %@",
+            (int)pid, mark];
+        NSString *out = [shellOutput(cmd) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        fishlog(@"[inject] ★ 接口注入 pid=%d 结果=%@", (int)pid, out.length ? out : @"(无输出)");
+        sendHttp(clientSocket, @{@"ok": @1, @"pid": @(pid), @"out": out ?: @""});
+
+    } else if ([reqPath isEqualToString:@"/data"] || [reqPath isEqualToString:@"/state"]
+               || [reqPath isEqualToString:@"/ping"] || [reqPath isEqualToString:@"/cannon"]
+               || [reqPath isEqualToString:@"/rate"] || [reqPath isEqualToString:@"/clear"]
+               || [reqPath isEqualToString:@"/plugin"]) {
+        // 【统一入口】按键精灵只认 8888，这里转给插件内部的 5399
+        // 注意：POST body 里的 n 会是 NSNumber，必须走 strParam 转字符串，否则拼接会崩
+        NSString *n = strParam(params, @"n");
+        if (!n.length) n = strParam(params, @"value");
+        if (!n.length) n = strParam(params, @"v");
+        if (!n.length) n = strParam(params, @"gap");
+        NSString *cmd = nil;
+        if ([reqPath isEqualToString:@"/data"]) cmd = @"data";
+        else if ([reqPath isEqualToString:@"/state"]) cmd = @"state";
+        else if ([reqPath isEqualToString:@"/ping"]) cmd = @"ping";
+        else if ([reqPath isEqualToString:@"/clear"]) cmd = @"clear";
+        else if ([reqPath isEqualToString:@"/cannon"]) cmd = n.length ? [@"cannon " stringByAppendingString:n] : @"state";
+        else if ([reqPath isEqualToString:@"/rate"]) cmd = n.length ? [@"rate " stringByAppendingString:n] : @"state";
+        else cmd = strParam(params, @"cmd");
+        if (!cmd.length) { sendHttp(clientSocket, @{@"ok": @0, @"err": @"no_cmd"}); return; }
+        NSString *reply = pluginCmd(cmd);
+        if (!reply) {
+            fishlog(@"[proxy] %@ → 插件无响应（未注入 / 游戏没开）", cmd);
+            sendHttp(clientSocket, @{@"ok": @0, @"err": @"plugin_down", @"cmd": cmd});
+        } else if ([reqPath isEqualToString:@"/data"]) {
+            // /data 直接透传插件原始 json，按键精灵 Encode.JsonToTable 一把过
+            sendHttpText(clientSocket, reply);
+        } else {
+            sendHttp(clientSocket, @{@"ok": @1, @"cmd": cmd, @"reply": reply});
+        }
+
     } else if ([reqPath isEqualToString:@"/status"]) {
         // v3.6.5：直接返回插件版本号（按键精灵比对用），不再返回 cache JSON
         sendHttpText(clientSocket, @"3.6.6");
@@ -538,7 +624,14 @@ static void handleRequest(int clientSocket, NSString *request) {
             @"endpoints": @[@"/send_sms?mobile=X&uuid=Y",
                             @"/reset_password?mobile=X&code=Y&password=Z&uuid=Y",
                             @"/status",
-                            @"/set_account?appid=X&openid=Y&refresh=Z&token=T&nickname=N&account=A&phone=P&phonepass=M&password=H&force=0|1"]
+                            @"/set_account?appid=X&openid=Y&refresh=Z&token=T&nickname=N&account=A&phone=P&phonepass=M&password=H&force=0|1",
+                            @"/inject                    注入当前 Fuel5（幂等，ok=1 成功 / ok=2 已注入 / ok=0 没开游戏）",
+                            @"/data                      读四项（转发插件 5399）",
+                            @"/state                     读当前目标/上限（转发）",
+                            @"/cannon?n=30000            改炮倍（转发，超上限自动夹）",
+                            @"/rate?n=8                  改倍率（转发，超上限自动夹）",
+                            @"/clear                     清目标（转发）",
+                            @"/plugin?cmd=data          任意插件命令逃生口"]
         });
     }
 }
@@ -687,11 +780,71 @@ static void *httpThread(void *arg) {
     return NULL;
 }
 
+// ---- 自动注入（v3.6.6 补丁）------
+// 背景：部分机器（iOS 12 + 老 CydiaSubstrate）在游戏进程启动时注入失败，
+//       只注入系统进程、注入不到 Fuel5。手动 cynject 却能成功。
+// 做法：daemon 常驻检测 Fuel5，新进程出现即 cynject 一次。
+// 安全性：dlopen 对同一路径去重，重复注入不会二次执行 %ctor（实测 3 条→3 条不变）。
+static pid_t findProcPid(const char *want) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t sz = 0;
+    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0) return 0;
+    struct kinfo_proc *list = malloc(sz);
+    if (!list) return 0;
+    if (sysctl(mib, 4, list, &sz, NULL, 0) != 0) { free(list); return 0; }
+    int n = (int)(sz / sizeof(struct kinfo_proc));
+    pid_t found = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(list[i].kp_proc.p_comm, want) == 0) { found = list[i].kp_proc.p_pid; break; }
+    }
+    free(list);
+    return found;
+}
+
+// 自动注入开关：这个文件存在 = 允许 daemon 自动注入；不存在 = 只接受手动 cynject
+#define INJECT_SWITCH "/var/mobile/Library/Preferences/com.jeffrey.fishtweak.inject_on"
+
+static void *injectThread(void *arg) {
+    (void)arg;
+    pid_t last = 0;
+    while (1) {
+        @autoreleasepool {
+            if (![[NSFileManager defaultManager] fileExistsAtPath:@INJECT_SWITCH]) {
+                last = 0;                       // 开关关着：清状态，不碰游戏
+                [NSThread sleepForTimeInterval:2.0];
+                continue;
+            }
+            pid_t pid = findProcPid("Fuel5");
+            if (pid > 0 && pid != last) {
+                last = pid;
+                // 关键：进程刚起来时 dyld 还在加载主程序，这时 dlopen 会跟主线程抢锁导致卡死，
+                // 必须等主程序加载完（6 秒）再注入，否则表现为"点登录进不去"。
+                fishlog(@"[inject] 发现游戏 pid=%d，等 6 秒后注入", pid);
+                [NSThread sleepForTimeInterval:6.0];
+                if (findProcPid("Fuel5") != pid) {
+                    fishlog(@"[inject] 游戏已退出(pid=%d)，本次不注入", pid);
+                } else {
+                    shellOutput([NSString stringWithFormat:
+                        @"cynject %d /Library/MobileSubstrate/DynamicLibraries/fishtweak.dylib 2>&1", pid]);
+                    fishlog(@"[inject] 已注入 pid=%d", pid);
+                }
+            } else if (pid <= 0 && last != 0) {
+                last = 0;   // 游戏退出，等下次
+            }
+        }
+        [NSThread sleepForTimeInterval:1.0];
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         NSLog(@"[FishTweakD] 常驻 daemon 启动 v3.6.6");
         pthread_t tid;
         pthread_create(&tid, NULL, httpThread, NULL);
+        pthread_t injTid;
+        pthread_create(&injTid, NULL, injectThread, NULL);   // v3.6.6 补丁：自动注入游戏进程
+        fishlog(@"[inject] 自动注入线程已启动");
         startUpdateLoop(); // v3.4.0：自动更新（GitHub Release）
         // 主线程保活（不轮询、无后台任务）
         [[NSRunLoop currentRunLoop] run];
